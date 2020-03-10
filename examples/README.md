@@ -33,4 +33,4 @@ reclaims memory and how many bytes of memory are being reclaimed.
 The [statistics module](lmsstats.py) provides a working example of how the APIs
 can be used in used to log per-iteration and aggregate memory statistics. The
 `LMSStatsLogger` and `LMSStatsSummary` classes in this module are used by the ManyModel
-example to demonstrate how the statistics APIs can used in model training.
+example to demonstrate how the statistics APIs can be used in model training.

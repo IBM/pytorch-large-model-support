@@ -34,7 +34,7 @@ frameworks see [this WML CE install documentation](https://www.ibm.com/support/k
 # How to enable LMS
 
 The LMS functionality is disabled by default in PyTorch and needs to be
-enabled before your model creates tensors. In most cases, enabling LMS is
+enabled before your model creates tensors. Enabling LMS is
 as simple as calling the enablement API at the start of your program:
 
 ```python
