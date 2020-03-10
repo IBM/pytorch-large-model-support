@@ -1,0 +1,2671 @@
+From 8dbea9ffa5af0b00fefe62bd3643d7fb587f919f Mon Sep 17 00:00:00 2001
+From: Matthew Brandyberry <mbrandy@us.ibm.com>
+Date: Thu, 8 Aug 2019 15:12:28 -0500
+Subject: [PATCH] PyTorch Large Model Support for PyTorch 1.2.0
+
+This commit delivers PyTorch Large Model Support
+for PyTorch at version 1.2.0
+
+See: https://github.com/IBM/pytorch-large-model-support
+---
+ aten/src/ATen/TensorGuard.h                   |  61 ++
+ aten/src/ATen/function_wrapper.py             |  35 +-
+ aten/src/ATen/native/cudnn/RNN.cpp            |   4 +
+ aten/src/ATen/templates/LegacyTHFunctions.cpp |   1 +
+ aten/src/ATen/templates/SparseTypeDerived.cpp |   1 +
+ aten/src/ATen/templates/TypeDefault.cpp       |   1 +
+ aten/src/ATen/templates/TypeDerived.cpp       |   1 +
+ aten/src/TH/generic/THStorage.cpp             |   4 +-
+ aten/src/TH/generic/THStorage.h               |   4 +-
+ aten/src/THC/THCGeneral.cpp                   |   2 +
+ aten/src/THC/THCStorage.cpp                   |  14 +
+ aten/src/THC/THCStorage.hpp                   |   2 +
+ aten/src/THC/generic/THCStorage.cpp           |   4 +-
+ aten/src/THC/generic/THCStorage.h             |   4 +-
+ c10/core/Allocator.h                          |   5 +
+ c10/core/LargeModelSupport.cpp                |   9 +
+ c10/core/LargeModelSupport.h                  | 191 +++++
+ c10/core/Storage.h                            |   6 +-
+ c10/core/StorageImpl.cpp                      |   8 +
+ c10/core/StorageImpl.h                        |  74 +-
+ c10/cuda/CUDACachingAllocator.cpp             | 806 +++++++++++++-----
+ c10/cuda/CUDACachingAllocator.h               |  28 +
+ c10/cuda/CUDAStream.cpp                       |  50 ++
+ c10/cuda/CUDAStream.h                         |   5 +
+ c10/util/IntrusiveList.h                      |  64 ++
+ test/test_cuda.py                             | 116 +++
+ torch/csrc/cuda/Module.cpp                    | 159 ++++
+ torch/csrc/generic/serialization.cpp          |   2 +-
+ torch/cuda/__init__.py                        | 175 ++++
+ 29 files changed, 1602 insertions(+), 234 deletions(-)
+ create mode 100644 aten/src/ATen/TensorGuard.h
+ create mode 100644 c10/core/LargeModelSupport.cpp
+ create mode 100644 c10/core/LargeModelSupport.h
+ create mode 100644 c10/util/IntrusiveList.h
+
+diff --git a/aten/src/ATen/TensorGuard.h b/aten/src/ATen/TensorGuard.h
+new file mode 100644
+index 0000000000..60b31c82f3
+--- /dev/null
++++ b/aten/src/ATen/TensorGuard.h
+@@ -0,0 +1,61 @@
++#pragma once
++
++#include <ATen/ATen.h>
++#include <ATen/ScalarType.h>
++#include <ATen/Tensor.h>
++
++#include <cstddef>
++#include <vector>
++
++namespace at {
++
++struct TensorGuard {
++  TensorGuard() = default;
++
++  explicit TensorGuard(const Tensor& tensor) {
++    if (tensor.has_storage()) {
++      StorageImpl* storage = tensor.storage().unsafeGetStorageImpl();
++      if (storage->lms_enabled()) {
++        storage->lms_pin();
++        storage_ = storage;
++      }
++    }
++  }
++
++  ~TensorGuard() {
++    if (storage_ != nullptr)
++      storage_->lms_unpin();
++  }
++
++ private:
++  StorageImpl* storage_ = nullptr;
++};
++
++struct TensorListGuard {
++  TensorListGuard() = default;
++
++  explicit TensorListGuard(const TensorList& tensors) {
++    int len = tensors.size();
++    for (int i = 0; i < len; i++) {
++      const Tensor &tensor = tensors[i];
++      if (tensor.has_storage()) {
++        StorageImpl* storage = tensor.storage().unsafeGetStorageImpl();
++        if (storage->lms_enabled()) {
++          storage->lms_pin();
++          storage_.push_back(storage);
++        }
++      }
++    }
++  }
++
++  ~TensorListGuard() {
++    for (auto storage : storage_) {
++      storage->lms_unpin();
++    }
++  }
++
++ private:
++  std::vector<StorageImpl*> storage_;
++};
++
++} // namespace at
+diff --git a/aten/src/ATen/function_wrapper.py b/aten/src/ATen/function_wrapper.py
+index d7e9578dfe..79e9c86572 100644
+--- a/aten/src/ATen/function_wrapper.py
++++ b/aten/src/ATen/function_wrapper.py
+@@ -50,7 +50,7 @@ ${return_type} ${api_name}(${type_method_formals}) {
+ #ifdef BUILD_NAMEDTENSOR
+     ${named_guard_declaration}
+ #endif
+-    ${device_guard_declaration}
++    ${device_guard_declarations}
+     Tensor ${broadcast_returns};
+     std::tie(${broadcast_returns}) = ${broadcast_function}(${broadcast_actuals}, "${api_name}");
+     return ${method_prefix_derived}${api_name}(${broadcast_modified_actuals});
+@@ -65,7 +65,7 @@ ${return_type} ${method_prefix_derived}${api_name}(${type_method_formals}) {
+ #ifdef BUILD_NAMEDTENSOR
+     ${named_guard_declaration}
+ #endif
+-    ${device_guard_declaration}
++    ${device_guard_declarations}
+     ${type_definition_body}
+ }
+ """)
+@@ -97,7 +97,7 @@ ${return_type} TypeDefault::${api_name}(${type_method_formals}) {
+ #ifdef BUILD_NAMEDTENSOR
+     ${named_guard_declaration}
+ #endif
+-    ${device_guard_declaration}
++    ${device_guard_declarations}
+     ${return_call} at::native::${native_type_method_dispatch}(${native_actuals});
+ }
+ """)
+@@ -107,7 +107,7 @@ ${return_type} ${Type}::${api_name}(${type_method_formals}) {
+ #ifdef BUILD_NAMEDTENSOR
+     ${named_guard_declaration}
+ #endif
+-    ${device_guard_declaration}
++    ${device_guard_declarations}
+     ${return_call} at::native::${native_type_method_dispatch}(${native_actuals});
+ }
+ """)
+@@ -511,7 +511,7 @@ FunctionOption = TypedDict('FunctionOption', {
+     'condition': str,
+     'const_mark': str,
+     'device_guard': bool,
+-    'device_guard_declaration': str,
++    'device_guard_declarations': List[str],
+     'dispatch_scalar_type_declaration': str,
+     'with_gil': bool,
+     'cpu_half': bool,
+@@ -592,14 +592,18 @@ FunctionCode = NamedTuple('FunctionCode', [
+ ])
+ 
+ 
+-def device_guard(option, dispatch_options, dispatch_tensor):
++def device_guards(option, dispatch_options, dispatch_tensor, formals):
+     # For factory methods the `DeviceGuard` is already in the template.
+     if option.get('device_guard', True):
++        code = []
+         if dispatch_options:
+-            return 'const DeviceGuard device_guard({}.device());'.format(dispatch_options['name'])
+-        if dispatch_tensor:
+-            return 'const OptionalDeviceGuard device_guard(device_of({}));'.format(dispatch_tensor)
+-    return '// DeviceGuard omitted'
++            code.append('const DeviceGuard device_guard({}.device());'.format(dispatch_options['name']))
++        elif dispatch_tensor:
++            code.append('const OptionalDeviceGuard device_guard(device_of({}));'.format(dispatch_tensor))
++        for arg in [f for f in formals if f['dynamic_type'] in {'Tensor', 'TensorList'}]:
++            code.append('const {0}Guard {1}_tensor_guard({1});'.format(arg['dynamic_type'], arg['name']))
++        return code
++    return ['// DeviceGuard omitted']
+ 
+ 
+ def named_guard(option, tensors, tensorlists):
+@@ -869,6 +873,7 @@ def create_generic(top_env, declarations):
+             # arguments list between output and input arguments
+             for buffer in option['buffers']:
+                 body.append('Tensor {} = at::empty({{0}}, this->options());'.format(buffer['name']))
++                body.append('const TensorGuard {0}_tensor_guard({0});'.format(buffer['name']))
+             actuals = [arg['name'] for arg in option['arguments'] if arg.get('output')]
+             actuals += [buffer['name'] for buffer in option['buffers']]
+             actuals += [arg['name'] for arg in option['arguments'] if not arg.get('output')]
+@@ -914,7 +919,7 @@ def create_generic(top_env, declarations):
+         option['method_prefix_derived'] = '' if broadcast_arg is None else 's_'
+         if option['mode'] == 'TH':
+             option['device_guard'] = False
+-        option['device_guard_declaration'] = device_guard(option, False, dispatch_tensor)
++        option['device_guard_declarations'] = device_guards(option, False, dispatch_tensor, formals)
+         option['named_guard_declaration'] = named_guard(option, find_tensors(formals),
+                                                         find_tensorlists(formals))
+         option['dispatch_scalar_type_declaration'] = dispatch_scalar_type(option, False, dispatch_tensor)
+@@ -1132,7 +1137,7 @@ def create_generic(top_env, declarations):
+         check_methods_do_not_start_with_underscore(option['name'], is_method)
+ 
+         option['method_prefix_derived'] = ''
+-        option['device_guard_declaration'] = device_guard(option, dispatch_options, dispatch_tensor)
++        option['device_guard_declarations'] = device_guards(option, dispatch_options, dispatch_tensor, formals)
+         option['named_guard_declaration'] = named_guard(option, find_tensors(formals),
+                                                         find_tensorlists(formals))
+         option['dispatch_scalar_type_declaration'] = dispatch_scalar_type(option, dispatch_options, dispatch_tensor)
+@@ -1356,10 +1361,14 @@ def create_derived(backend_type_env, declarations):
+             tensor_arg = ('{}_ == nullptr ? (TensorImpl*)UndefinedTensorImpl::singleton() : (TensorImpl*){}_'
+                           .format(name, name))
+         intrusive_ptr_type = 'c10::intrusive_ptr<TensorImpl, UndefinedTensorImpl>'
+-        return [
++        code = [
+             'auto {}_ = {};'.format(name, allocation),
+             'auto {} = Tensor({}::reclaim({}));'.format(name, intrusive_ptr_type, tensor_arg),
+         ]
++        if is_cuda:
++            code.append('const TensorGuard {0}_tensor_guard({0});'.format(name))
++        return code
++
+ 
+     def resize_arg(arg):
+         # type: (THFormal) -> str
+diff --git a/aten/src/ATen/native/cudnn/RNN.cpp b/aten/src/ATen/native/cudnn/RNN.cpp
+index 3dbe44e9c0..5acbcc7145 100644
+--- a/aten/src/ATen/native/cudnn/RNN.cpp
++++ b/aten/src/ATen/native/cudnn/RNN.cpp
+@@ -4,6 +4,7 @@
+ #include <ATen/InitialTensorOptions.h>
+ #include <ATen/MatrixRef.h>
+ #include <ATen/NativeFunctions.h>
++#include <ATen/TensorGuard.h>
+ #include <ATen/TensorUtils.h>
+ #include <ATen/cuda/CUDAConfig.h>
+ #include <ATen/cuda/CUDAEvent.h>
+@@ -778,6 +779,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> _cudnn_rnn(
+           &reserve_size
+           ));
+     reserve = at::empty(reserve_size, input.options().dtype(kByte));
++    TensorListGuard rnn_tensor_guard({x, y, hy, cy});
+     AT_CUDNN_CHECK(cudnnRNNForwardTraining(
+           handle,
+           descs.rnn_desc.desc(),
+@@ -794,6 +796,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> _cudnn_rnn(
+           ));
+   } else { // inference
+     reserve = at::empty({0}, input.options().dtype(kByte));
++    TensorListGuard rnn_tensor_guard({x, y, hy, cy});
+     AT_CUDNN_CHECK(cudnnRNNForwardInference(
+           handle,
+           descs.rnn_desc.desc(),
+@@ -1199,6 +1202,7 @@ Tensor try_get_weight_buf(
+   }
+ 
+   // Get and check data pointers
++  TensorGuard weight_buf_tensor_guard(weight_buf);
+   auto expected_data_ptrs = get_expected_data_ptrs(
+       weight_buf, handle, rnn, rnn_desc, x_desc, datatype);
+ 
+diff --git a/aten/src/ATen/templates/LegacyTHFunctions.cpp b/aten/src/ATen/templates/LegacyTHFunctions.cpp
+index 50baa294fb..9a700b094f 100644
+--- a/aten/src/ATen/templates/LegacyTHFunctions.cpp
++++ b/aten/src/ATen/templates/LegacyTHFunctions.cpp
+@@ -9,6 +9,7 @@
+ #endif
+ #include <ATen/${Generator}.h>
+ #include <ATen/ExpandUtils.h>
++#include <ATen/TensorGuard.h>
+ ${th_headers}
+ ${extra_cuda_headers}
+ 
+diff --git a/aten/src/ATen/templates/SparseTypeDerived.cpp b/aten/src/ATen/templates/SparseTypeDerived.cpp
+index a706ac0f70..311cc45a8e 100644
+--- a/aten/src/ATen/templates/SparseTypeDerived.cpp
++++ b/aten/src/ATen/templates/SparseTypeDerived.cpp
+@@ -10,6 +10,7 @@
+ #include <ATen/${Generator}.h>
+ #include <c10/core/Allocator.h>
+ #include <ATen/DeviceGuard.h>
++#include <ATen/TensorGuard.h>
+ #include <ATen/NativeFunctions.h>
+ #include <ATen/Utils.h>
+ #include <ATen/WrapDimUtils.h>
+diff --git a/aten/src/ATen/templates/TypeDefault.cpp b/aten/src/ATen/templates/TypeDefault.cpp
+index 8f000827dc..df71393622 100644
+--- a/aten/src/ATen/templates/TypeDefault.cpp
++++ b/aten/src/ATen/templates/TypeDefault.cpp
+@@ -14,6 +14,7 @@
+ #include <ATen/Tensor.h>
+ #include <c10/core/TensorOptions.h>
+ #include <ATen/DeviceGuard.h>
++#include <ATen/TensorGuard.h>
+ #include <ATen/SparseTensorUtils.h>
+ #include <ATen/core/ATenDispatch.h>
+ 
+diff --git a/aten/src/ATen/templates/TypeDerived.cpp b/aten/src/ATen/templates/TypeDerived.cpp
+index 58851b0f58..530965d443 100644
+--- a/aten/src/ATen/templates/TypeDerived.cpp
++++ b/aten/src/ATen/templates/TypeDerived.cpp
+@@ -11,6 +11,7 @@ $storage_tensor_headers
+ #include <ATen/${Generator}.h>
+ #include <c10/core/Allocator.h>
+ #include <ATen/DeviceGuard.h>
++#include <ATen/TensorGuard.h>
+ #include <ATen/NativeFunctions.h>
+ #ifdef BUILD_NAMEDTENSOR
+ #include <ATen/NamedTensorUtils.h>
+diff --git a/aten/src/TH/generic/THStorage.cpp b/aten/src/TH/generic/THStorage.cpp
+index 1d70db9b6e..d5003be173 100644
+--- a/aten/src/TH/generic/THStorage.cpp
++++ b/aten/src/TH/generic/THStorage.cpp
+@@ -4,7 +4,7 @@
+ 
+ #include <new>
+ 
+-scalar_t* THStorage_(data)(const THStorage *self)
++scalar_t* THStorage_(data)(THStorage *self)
+ {
+ #if defined(THQUANTIZED)
+   return reinterpret_cast<scalar_t*>(self->data<quantized_t>());
+@@ -162,7 +162,7 @@ void THStorage_(set)(THStorage *self, ptrdiff_t idx, scalar_t value)
+   THStorage_(data)(self)[idx] = value;
+ }
+ 
+-scalar_t THStorage_(get)(const THStorage *self, ptrdiff_t idx)
++scalar_t THStorage_(get)(THStorage *self, ptrdiff_t idx)
+ {
+   THArgCheck((idx >= 0) && (idx < self->numel()), 2, "out of bounds");
+   return THStorage_(data)(self)[idx];
+diff --git a/aten/src/TH/generic/THStorage.h b/aten/src/TH/generic/THStorage.h
+index 1d0f942040..fd673a26a2 100644
+--- a/aten/src/TH/generic/THStorage.h
++++ b/aten/src/TH/generic/THStorage.h
+@@ -36,13 +36,13 @@
+ #define THBoolStorage THStorage
+ #define THBFloat16Storage THStorage
+ 
+-TH_API scalar_t* THStorage_(data)(const THStorage*);
++TH_API scalar_t* THStorage_(data)(THStorage*);
+ TH_API ptrdiff_t THStorage_(size)(const THStorage*);
+ TH_API size_t THStorage_(elementSize)(void);
+ 
+ /* slow access -- checks everything */
+ TH_API void THStorage_(set)(THStorage*, ptrdiff_t, scalar_t);
+-TH_API scalar_t THStorage_(get)(const THStorage*, ptrdiff_t);
++TH_API scalar_t THStorage_(get)(THStorage*, ptrdiff_t);
+ 
+ TH_API THStorage* THStorage_(new)(void);
+ TH_API THStorage* THStorage_(newWithSize)(ptrdiff_t size);
+diff --git a/aten/src/THC/THCGeneral.cpp b/aten/src/THC/THCGeneral.cpp
+index 8314b8abe8..6765792578 100644
+--- a/aten/src/THC/THCGeneral.cpp
++++ b/aten/src/THC/THCGeneral.cpp
+@@ -50,6 +50,8 @@ void THCudaInit(THCState* state)
+   THCudaCheck(cudaGetDeviceCount(&numDevices));
+   state->numDevices = numDevices;
+ 
++  c10::cuda::CUDACachingAllocator::init(numDevices, state->cudaHostAllocator);
++
+   int device = 0;
+   THCudaCheck(cudaGetDevice(&device));
+ 
+diff --git a/aten/src/THC/THCStorage.cpp b/aten/src/THC/THCStorage.cpp
+index c28d8d0253..70d04cf024 100644
+--- a/aten/src/THC/THCStorage.cpp
++++ b/aten/src/THC/THCStorage.cpp
+@@ -28,6 +28,11 @@ void THCStorage_resize(THCState *state, THCStorage *self, ptrdiff_t size)
+ 
+   size_t itemsize = self->itemsize();
+ 
++  if (self->lms_enabled()) {
++    THAssert(!self->lms_reclaimed());
++    self->lms_release_resources();
++  }
++
+   if(size == 0)
+   {
+     self->set_data_ptr(at::DataPtr(nullptr, at::Device(at::DeviceType::CUDA, device)));
+@@ -69,3 +74,12 @@ THC_API THCStorage* THCStorage_new(
+       true).release();
+   return storage;
+ }
++
++void THCStorage_copy_to_host(THCState *state, THCStorage *storage, void *dst) {
++  size_t size = storage->capacity();
++  if (storage->lms_reclaimed()) {
++    storage->lms_copy_reclaimed_data(dst, size);
++  } else {
++    THCudaCheck(cudaMemcpy(dst, storage->data(), size, cudaMemcpyDeviceToHost));
++  }
++}
+diff --git a/aten/src/THC/THCStorage.hpp b/aten/src/THC/THCStorage.hpp
+index 62a1d950a4..6f539274a0 100644
+--- a/aten/src/THC/THCStorage.hpp
++++ b/aten/src/THC/THCStorage.hpp
+@@ -20,6 +20,8 @@ THC_API void THCStorage_retain(THCState *state, THCStorage *storage);
+ THC_API void THCStorage_resize(THCState *state, THCStorage *storage, ptrdiff_t size);
+ THC_API int THCStorage_getDevice(THCState* state, const THCStorage* storage);
+ 
++THC_API void THCStorage_copy_to_host(THCState *state, THCStorage *storage, void *dst);
++
+ THC_API THCStorage* THCStorage_newWithDataAndAllocator(
+   THCState *state, at::ScalarType scalar_type,
+   at::DataPtr&& data, ptrdiff_t size,
+diff --git a/aten/src/THC/generic/THCStorage.cpp b/aten/src/THC/generic/THCStorage.cpp
+index b5495e1296..d2dd0fd402 100644
+--- a/aten/src/THC/generic/THCStorage.cpp
++++ b/aten/src/THC/generic/THCStorage.cpp
+@@ -5,7 +5,7 @@
+ #include <c10/util/intrusive_ptr.h>
+ #include <c10/util/typeid.h>
+ 
+-scalar_t* THCStorage_(data)(THCState *state, const THCStorage *self)
++scalar_t* THCStorage_(data)(THCState *state, THCStorage *self)
+ {
+   return self->data<scalar_t>();
+ }
+@@ -30,7 +30,7 @@ void THCStorage_(set)(THCState *state, THCStorage *self, ptrdiff_t index, scalar
+   THCudaCheck(cudaStreamSynchronize(stream));
+ }
+ 
+-scalar_t THCStorage_(get)(THCState *state, const THCStorage *self, ptrdiff_t index)
++scalar_t THCStorage_(get)(THCState *state, THCStorage *self, ptrdiff_t index)
+ {
+   THArgCheck((index >= 0) && (index < self->numel()), 2, "index out of bounds");
+   scalar_t value;
+diff --git a/aten/src/THC/generic/THCStorage.h b/aten/src/THC/generic/THCStorage.h
+index cbcdaf5f3e..c6e47c0b60 100644
+--- a/aten/src/THC/generic/THCStorage.h
++++ b/aten/src/THC/generic/THCStorage.h
+@@ -17,13 +17,13 @@
+ #define THCudaBoolStorage       THCStorage
+ #define THCudaBFloat16Storage   THCStorage
+ 
+-THC_API scalar_t* THCStorage_(data)(THCState *state, const THCStorage*);
++THC_API scalar_t* THCStorage_(data)(THCState *state, THCStorage*);
+ THC_API ptrdiff_t THCStorage_(size)(THCState *state, const THCStorage*);
+ THC_API int THCStorage_(elementSize)(THCState *state);
+ 
+ /* slow access -- checks everything */
+ THC_API void THCStorage_(set)(THCState *state, THCStorage*, ptrdiff_t, scalar_t);
+-THC_API scalar_t THCStorage_(get)(THCState *state, const THCStorage*, ptrdiff_t);
++THC_API scalar_t THCStorage_(get)(THCState *state, THCStorage*, ptrdiff_t);
+ 
+ THC_API THCStorage* THCStorage_(new)(THCState *state);
+ THC_API THCStorage* THCStorage_(newWithSize)(THCState *state, ptrdiff_t size);
+diff --git a/c10/core/Allocator.h b/c10/core/Allocator.h
+index 06b77c7b95..0badabd385 100644
+--- a/c10/core/Allocator.h
++++ b/c10/core/Allocator.h
+@@ -124,6 +124,8 @@ inline bool operator!=(std::nullptr_t, const DataPtr& dp) noexcept {
+   return dp;
+ }
+ 
++struct LMSImpl;
++
+ // Note [raw_allocate/raw_deallocate and Thrust]
+ // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ // Thrust's support for custom allocators requires us to write something
+@@ -157,6 +159,9 @@ struct C10_API Allocator {
+   virtual DeleterFnPtr raw_deleter() const {
+     return nullptr;
+   }
++  virtual LMSImpl* lms() const {
++    return nullptr;
++  }
+   void* raw_allocate(size_t n) {
+     auto dptr = allocate(n);
+     AT_ASSERT(dptr.get() == dptr.get_context());
+diff --git a/c10/core/LargeModelSupport.cpp b/c10/core/LargeModelSupport.cpp
+new file mode 100644
+index 0000000000..5a5b59f5dc
+--- /dev/null
++++ b/c10/core/LargeModelSupport.cpp
+@@ -0,0 +1,9 @@
++#include <c10/core/LargeModelSupport.h>
++
++namespace c10 {
++
++c10::LMS* c10::LMS::from_list_hook(c10::IntrusiveListHook *hook) {
++  return (LMS *)((char *)hook - offsetof(LMS, list_hook_));
++}
++
++} // namespace at
+diff --git a/c10/core/LargeModelSupport.h b/c10/core/LargeModelSupport.h
+new file mode 100644
+index 0000000000..7e2518f9c8
+--- /dev/null
++++ b/c10/core/LargeModelSupport.h
+@@ -0,0 +1,191 @@
++#pragma once
++
++#include <c10/core/Allocator.h>
++#include <c10/util/IntrusiveList.h>
++
++#include <atomic>
++#include <cstring>
++
++namespace c10 {
++
++typedef void* LMSSyncEvent_t;
++
++struct LMSImpl {
++  LMSImpl(Allocator* allocator) : allocator_(allocator), reclaimed_(false), pincount_(0) {}
++  LMSImpl() = delete;
++  virtual ~LMSImpl() {}
++
++  virtual void release_resources() {
++    data_ptr_.clear();
++    reclaimed_ = false;
++  }
++
++  virtual void reclaim_list_add(IntrusiveListHook* list_hook) = 0;
++  virtual bool reclaim_list_remove(IntrusiveListHook* list_hook) = 0;
++
++  bool reclaimed() const {
++    return reclaimed_;
++  };
++
++  bool pin() {
++    bool initial = (++pincount_ == 1);
++    return initial;
++  }
++
++  bool unpin() {
++    bool final = (--pincount_ == 0);
++    if (final && reclaimed_)
++      pagein_sync();
++    return final;
++  }
++
++  void pagein(void* dst, size_t size) {
++    AT_ASSERT(reclaimed_ == true);
++    void* src = data_ptr_.get();
++    AT_ASSERT(dst);
++    AT_ASSERT(src);
++
++    do_pagein(dst, src, size);
++  }
++
++  void pagein_sync() {
++    do_pagein_sync();
++    reclaimed_ = false;
++  }
++
++  void pageout(void* src, size_t size, LMSSyncEvent_t sync_event) {
++    AT_ASSERT(reclaimed_ == false);
++
++    void* dst = data_ptr_.get();
++    if (!dst) {
++      data_ptr_ = allocator_->allocate(size);
++      dst = data_ptr_.get();
++    }
++    AT_ASSERT(src);
++    AT_ASSERT(dst);
++
++    do_pageout(dst, src, size, sync_event);
++  }
++
++  void pageout_sync() {
++    do_pageout_sync();
++    reclaimed_ = true;
++  }
++
++  void copy_reclaimed_data(void* dst, size_t size) const {
++    AT_ASSERT(reclaimed_ == true);
++    memcpy(dst, data_ptr_.get(), size);
++  }
++
++protected:
++  virtual void do_pagein(void* dst, void* src, size_t size) = 0;
++  virtual void do_pagein_sync() = 0;
++  virtual void do_pageout(void* dst, void* src, size_t size, LMSSyncEvent_t sync_event) = 0;
++  virtual void do_pageout_sync() = 0;
++
++  Allocator* allocator_ = nullptr;
++  bool reclaimed_ = false;
++  DataPtr data_ptr_;
++  mutable std::atomic<size_t> pincount_;
++};
++
++
++struct LMS {
++  LMS(LMSImpl* lms) { set(lms); }
++  LMS() = delete;
++  ~LMS() { unset(); }
++
++  LMS& operator=(LMS&& other) = default;
++  LMS(LMS&& other) = default;
++
++  static LMS* from_list_hook(IntrusiveListHook *hook);
++
++  bool enabled() const {
++    return lms_ != nullptr;
++  };
++
++  void set(LMSImpl* lms) {
++    AT_ASSERT(lms_ == nullptr);
++    lms_ = lms;
++  }
++
++  void unset() {
++    if (enabled()) {
++      reclaim_list_remove();
++      delete lms_;
++      lms_ = nullptr;
++    }
++  }
++
++  void release_resources() {
++    if (enabled()) {
++      reclaim_list_remove();
++      lms_->release_resources();
++    }
++  }
++
++  bool reclaimed() const {
++    return enabled() && lms_->reclaimed();
++  };
++
++  void list_add(IntrusiveList* list) {
++    list->append(&list_hook_);
++  }
++
++  bool list_remove() {
++    return list_hook_.remove();
++  }
++
++  bool pin() {
++    bool initial = enabled() && lms_->pin();
++    if (initial)
++      reclaim_list_remove();
++    return initial;
++  }
++
++  bool unpin() {
++    bool final = enabled() && lms_->unpin();
++    if (final)
++      reclaim_list_add();
++    return final;
++  }
++
++  void pagein(void* data_ptr, size_t size) const {
++    lms_->pagein(data_ptr, size);
++  }
++
++  void pagein_sync() const {
++    lms_->pagein_sync();
++  }
++
++  void pageout(void* data_ptr, size_t size, LMSSyncEvent_t sync_event, IntrusiveList *async_queue = nullptr) {
++    lms_->pageout(data_ptr, size, sync_event);
++    if (async_queue)
++      list_add(async_queue);
++  }
++
++  void pageout_sync(IntrusiveList *async_queue = nullptr) {
++    if (async_queue)
++      list_remove();
++    lms_->pageout_sync();
++  }
++
++  void copy_reclaimed_data(void* dst, size_t size) const {
++    lms_->copy_reclaimed_data(dst, size);
++  }
++
++  void reclaim_list_add() {
++    lms_->reclaim_list_add(&list_hook_);
++  }
++
++  bool reclaim_list_remove() {
++    if (!list_hook_.attached()) return false;
++
++    return lms_->reclaim_list_remove(&list_hook_);
++  }
++
++ private:
++  IntrusiveListHook list_hook_;
++  LMSImpl* lms_ = nullptr;
++};
++} // namespace c10
+diff --git a/c10/core/Storage.h b/c10/core/Storage.h
+index 6d86119eff..9b614ce929 100644
+--- a/c10/core/Storage.h
++++ b/c10/core/Storage.h
+@@ -56,10 +56,10 @@ struct C10_API Storage {
+   }
+ 
+   template <typename T>
+-  T* data() const { return storage_impl_->data<T>(); }
++  T* data() const { return storage_impl_.get()->data<T>(); }
+ 
+   template <typename T>
+-  T* unsafe_data() const { return storage_impl_->unsafe_data<T>(); }
++  T* unsafe_data() const { return storage_impl_.get()->unsafe_data<T>(); }
+ 
+   size_t elementSize() const {
+     return storage_impl_->itemsize();
+@@ -104,7 +104,7 @@ struct C10_API Storage {
+   }
+ 
+   const at::DataPtr& data_ptr() const {
+-    return storage_impl_->data_ptr();
++    return storage_impl_.get()->data_ptr();
+   }
+ 
+   // Returns the previous data_ptr
+diff --git a/c10/core/StorageImpl.cpp b/c10/core/StorageImpl.cpp
+index 797e21f079..90e3ac0f7b 100644
+--- a/c10/core/StorageImpl.cpp
++++ b/c10/core/StorageImpl.cpp
+@@ -1 +1,9 @@
+ #include <c10/core/StorageImpl.h>
++
++namespace c10 {
++
++c10::StorageImpl* c10::StorageImpl::from_list_hook(c10::IntrusiveListHook *hook) {
++  return (StorageImpl *)((char *)c10::LMS::from_list_hook(hook) - offsetof(StorageImpl, lms_));
++}
++
++} // namespace at
+diff --git a/c10/core/StorageImpl.h b/c10/core/StorageImpl.h
+index 579ef00820..4bb39a4c16 100644
+--- a/c10/core/StorageImpl.h
++++ b/c10/core/StorageImpl.h
+@@ -2,6 +2,7 @@
+ 
+ #include <c10/core/Allocator.h>
+ #include <c10/core/ScalarType.h>
++#include <c10/core/LargeModelSupport.h>
+ 
+ #include <c10/util/intrusive_ptr.h>
+ 
+@@ -20,7 +21,8 @@ struct C10_API StorageImpl final : public c10::intrusive_ptr_target {
+         numel_(numel),
+         resizable_(resizable),
+         received_cuda_(false),
+-        allocator_(allocator) {
++        allocator_(allocator),
++        lms_(allocator ? allocator->lms() : nullptr) {
+     if (resizable) {
+       AT_ASSERTM(
+           allocator_, "For resizable storage, allocator must be provided");
+@@ -53,6 +55,7 @@ struct C10_API StorageImpl final : public c10::intrusive_ptr_target {
+   ~StorageImpl() = default;
+ 
+   void reset() {
++    lms_.unset();
+     data_ptr_.clear();
+     numel_ = 0;
+   }
+@@ -63,7 +66,7 @@ struct C10_API StorageImpl final : public c10::intrusive_ptr_target {
+   }
+ 
+   template <typename T>
+-  inline T* data() const {
++  inline T* data() {
+     auto data_type = caffe2::TypeMeta::Make<T>();
+     if (dtype() != data_type) {
+       AT_ERROR(
+@@ -76,11 +79,13 @@ struct C10_API StorageImpl final : public c10::intrusive_ptr_target {
+   }
+ 
+   template <typename T>
+-  inline T* unsafe_data() const {
++  inline T* unsafe_data() {
++    lms_ensure_data();
+     return static_cast<T*>(this->data_ptr_.get());
+   }
+ 
+   void release_resources() override {
++    lms_.release_resources();
+     data_ptr_.clear();
+   }
+ 
+@@ -106,10 +111,7 @@ struct C10_API StorageImpl final : public c10::intrusive_ptr_target {
+   };
+ 
+   at::DataPtr& data_ptr() {
+-    return data_ptr_;
+-  };
+-
+-  const at::DataPtr& data_ptr() const {
++    lms_ensure_data();
+     return data_ptr_;
+   };
+ 
+@@ -130,10 +132,7 @@ struct C10_API StorageImpl final : public c10::intrusive_ptr_target {
+ 
+   // TODO: Return const ptr eventually if possible
+   void* data() {
+-    return data_ptr_.get();
+-  }
+-
+-  void* data() const {
++    lms_ensure_data();
+     return data_ptr_.get();
+   }
+ 
+@@ -192,6 +191,7 @@ struct C10_API StorageImpl final : public c10::intrusive_ptr_target {
+       at::DataPtr&& data_ptr,
+       const caffe2::TypeMeta& data_type,
+       size_t capacity) {
++    lms_.unset();
+     data_type_ = data_type;
+     // TODO: Use CAFFE_ENFORCE_WITH_CALLER equivalent
+     // For now causes lots of redefine issues if caffe2/core/logging.h is used
+@@ -221,7 +221,58 @@ struct C10_API StorageImpl final : public c10::intrusive_ptr_target {
+     return received_cuda_;
+   }
+ 
++  // Large Model Support
++  bool lms_enabled() const                  { return lms_.enabled(); }
++  bool lms_reclaimed() const                { return lms_.reclaimed(); }
++  void lms_release_resources()              { lms_.release_resources(); }
++  void lms_list_add(IntrusiveList* list)    { lms_.list_add(list); }
++  bool lms_list_remove()                    { return lms_.list_remove(); }
++  void* allocation_ptr() const              { return data_ptr_.get(); }
++  static StorageImpl* from_list_hook(IntrusiveListHook *hook);
++
++  bool lms_pin() {
++    bool initial = lms_.pin();
++    if (initial && lms_reclaimed()) {
++      lms_pagein();
++    }
++    return initial;
++  }
++
++  bool lms_unpin() {
++    bool final = lms_.unpin();
++    return final;
++  }
++
++  void lms_pageout(LMSSyncEvent_t sync_event, IntrusiveList *async_queue = nullptr) {
++    lms_.pageout(data_ptr_.get(), capacity(), sync_event, async_queue);
++  }
++
++  void lms_pageout_sync(IntrusiveList *async_queue = nullptr) {
++    lms_.pageout_sync(async_queue);
++    set_data_ptr(at::DataPtr(nullptr, device()));
++  }
++
++  void lms_copy_reclaimed_data(void* dst, size_t size) {
++    lms_.copy_reclaimed_data(dst, size);
++  }
++
+  private:
++  void lms_pagein() {
++    AT_ASSERT(!data_ptr_);
++    size_t size = capacity();
++    set_data_ptr(allocator()->allocate(size));
++    lms_.pagein(data_ptr_.get(), size);
++  }
++
++  void lms_ensure_data() {
++    if (!lms_enabled() || lms_.reclaim_list_remove() || !lms_reclaimed())
++      return;
++
++    if (!data_ptr_)
++      lms_pagein();
++    lms_.pagein_sync();
++  }
++
+   caffe2::TypeMeta data_type_;
+   DataPtr data_ptr_;
+   int64_t numel_;
+@@ -230,5 +281,6 @@ struct C10_API StorageImpl final : public c10::intrusive_ptr_target {
+   // local to process cuda memory allocation
+   bool received_cuda_;
+   Allocator* allocator_;
++  LMS lms_;
+ };
+ } // namespace c10
+diff --git a/c10/cuda/CUDACachingAllocator.cpp b/c10/cuda/CUDACachingAllocator.cpp
+index 06e148890d..65977ae3cd 100644
+--- a/c10/cuda/CUDACachingAllocator.cpp
++++ b/c10/cuda/CUDACachingAllocator.cpp
+@@ -68,14 +68,24 @@ struct DeviceStats {
+   uint64_t   max_amount_allocated;  // max total amount allocated in bytes
+   uint64_t   amount_cached;         // total amount in cache in bytes
+   uint64_t   max_amount_cached;     // max total amount in cache in bytes
++  uint64_t   amount_inactive;       // total amount in reclaim list in bytes
++  uint64_t   amount_active()        { return amount_allocated - amount_inactive; }
++  uint64_t   max_amount_active;     // max total active in bytes
++  uint64_t   amount_reclaimed;
++  uint64_t   alloc_distribution[NUM_ALLOC_SOURCES];
+ 
+   DeviceStats() :
+       amount_allocated(0), max_amount_allocated(0),
+-      amount_cached(0), max_amount_cached(0) { }
++      amount_cached(0), max_amount_cached(0),
++      amount_inactive(0), max_amount_active(0),
++      amount_reclaimed(0) {
++    resetAllocStats();
++  }
+ 
+   void increaseAllocated(size_t delta) {
+     amount_allocated += delta;
+     max_amount_allocated = std::max(max_amount_allocated, amount_allocated);
++    max_amount_active = std::max(max_amount_active, amount_active());
+   }
+ 
+   void decreaseAllocated(size_t delta) {
+@@ -90,6 +100,28 @@ struct DeviceStats {
+   void decreaseCached(size_t delta) {
+     amount_cached -= delta;
+   }
++
++  void increaseInactive(size_t delta) {
++    amount_inactive += delta;
++  }
++
++  void decreaseInactive(size_t delta, bool reclaimed=false) {
++    amount_inactive -= delta;
++    max_amount_active = std::max(max_amount_active, amount_active());
++
++    if (reclaimed)
++      amount_reclaimed += delta;
++  }
++
++  void resetAllocStats() {
++    memset(alloc_distribution, 0, sizeof(alloc_distribution));
++  }
++  void getAllocStats(uint64_t* distribution) {
++    memcpy(distribution, alloc_distribution, sizeof(alloc_distribution));
++  }
++  void recordAllocSource(AllocSource source) {
++    alloc_distribution[source] += 1;
++  }
+ };
+ 
+ struct Block;
+@@ -120,9 +152,6 @@ struct Block {
+ 
+ static bool BlockComparator(const Block* a, const Block* b)
+ {
+-  if (a->device != b->device) {
+-    return a->device < b->device;
+-  }
+   if (a->stream != b->stream) {
+     return (uintptr_t)a->stream < (uintptr_t)b->stream;
+   }
+@@ -151,128 +180,212 @@ static std::string format_size(uint64_t size) {
+   return os.str();
+ }
+ 
++#define LMS_SIZE_DEFAULT (1 << 20) // 1 MB
++
++struct LMSSettings {
++  LMSSettings() :
++    enabled_(false), size_(LMS_SIZE_DEFAULT), limit_(0), host_allocator_(nullptr) {}
++
++  bool enabled()                 { return enabled_; }
++  void set_enabled(bool enabled) { enabled_ = enabled; }
++  size_t size()                  { return size_; }
++  void set_size(size_t size)     { size_ = size; }
++  size_t limit()                 { return limit_; }
++  void set_limit(size_t limit)   { limit_ = limit; }
++  at::Allocator* host_allocator()                        { return host_allocator_; }
++  void set_host_allocator(at::Allocator* host_allocator) { host_allocator_ = host_allocator; }
++
++  bool enabled(size_t size) {
++    return enabled_ && size >= size_;
++  }
++  bool limit_alloc(DeviceStats& stats, size_t alloc_size) {
++    return (stats.amount_cached + alloc_size) > limit_;
++  }
++
++private:
++  bool enabled_;
++  size_t size_;
++  size_t limit_;
++  at::Allocator* host_allocator_;
++};
++
++struct AllocParams {
++  AllocParams(int device, size_t size, cudaStream_t stream, BlockPool* pool, size_t alloc_size,
++              LMSSettings* lms, DeviceStats& stats) :
++    search_key(device, stream, size),
++    pool(pool),
++    alloc_size(alloc_size),
++    lms_enabled(lms->enabled(size)),
++    limit_alloc(lms_enabled && lms->limit_alloc(stats, alloc_size)),
++    block(nullptr),
++    err(cudaSuccess) {}
++
++  int device() { return search_key.device; }
++  cudaStream_t stream() { return search_key.stream; }
++  size_t size() { return search_key.size; }
++
++  Block search_key;
++  BlockPool* pool;
++  size_t alloc_size;
++  bool lms_enabled;
++  bool limit_alloc;
++  Block* block;
++  AllocSource source;
++  cudaError_t err;
++};
++
+ } // namespace
+ 
+-struct THCCachingAllocator
++struct DeviceCachingAllocator
+ {
+   // device statistics
+-  std::vector<DeviceStats> device_stats;
++  DeviceStats stats;
+ 
+   // lock around all operations
+   std::recursive_mutex mutex;
+ 
+-  // lock around calls to cudaFree (to prevent deadlocks with NCCL)
+-  std::mutex cuda_free_mutex;
+-
+   // cached blocks larger than 1 MB
+   BlockPool large_blocks;
+ 
+   // cached blocks 1 MB or smaller
+   BlockPool small_blocks;
+ 
+-  // allocated blocks by device pointer
+-  std::unordered_map<void*, Block*> allocated_blocks;
+-
+   // outstanding cuda events
+   std::deque<std::pair<cudaEvent_t, Block*>> cuda_events;
+ 
+-  THCCachingAllocator() :
++  at::IntrusiveList reclaim_list;
++
++  DeviceCachingAllocator() :
+       large_blocks(BlockComparator),
+       small_blocks(BlockComparator) {}
+ 
+-  DeviceStats &get_stats_for_device(int device) {
+-    AT_ASSERT(device >= 0);
+-    if ((size_t) device >= device_stats.size()) {
+-      device_stats.resize(device + 1);
++  bool get_free_block(AllocParams& p, AllocSource source)
++  {
++    BlockPool& pool = *p.pool;
++    auto it = pool.lower_bound(&p.search_key);
++    if (it == pool.end() || (*it)->stream != p.stream())
++      return false;
++    p.block = *it;
++    p.source = source;
++    pool.erase(it);
++    return true;
++  }
++
++  bool trigger_free_memory_callbacks(AllocParams& p) {
++    bool freed_memory = false;
++    for (const auto& name : FreeCudaMemoryCallbacksRegistry()->Keys()) {
++      freed_memory |=
++        FreeCudaMemoryCallbacksRegistry()->Create(name)->Execute();
+     }
+-    return device_stats.at(device);
++    return freed_memory;
++  }
++
++  bool alloc_block(AllocParams& p, bool record_error, AllocSource source)
++  {
++    size_t size = p.alloc_size;
++    void* ptr;
++    cudaError_t err;
++    err = cudaMalloc(&ptr, size);
++    if (err != cudaSuccess) {
++      if (record_error) p.err = err; else cudaGetLastError();
++      return false;
++    }
++
++    stats.increaseCached(size);
++    p.block = new Block(p.device(), p.stream(), size, p.pool, (char*)ptr);
++    p.source = source;
++    return (p.block != nullptr);
++  }
++
++  bool try_lms_reclaim(AllocParams& p) {
++    size_t size = p.size();
++    cudaStream_t stream = p.stream();
++    cudaEvent_t sync_event;
++
++    AT_ASSERT(stream == cuda::getCurrentCUDAStream().stream());
++    C10_CUDA_CHECK(cudaEventCreate(&sync_event));
++    C10_CUDA_CHECK(cudaEventRecord(sync_event, stream));
++
++    bool found =
++      // a. Search reclaim list for a suitable inactive allocation
++      (reclaim_one(size, sync_event) && get_free_block(p, RECLAIM_ONE))
++      // b. Reclaim fragments of suitable allocations
++      || (reclaim_fragments(size, sync_event) && get_free_block(p, RECLAIM_FRAGMENTS))
++      // c. Attempt allocate (if not done earlier due to limit)
++      || (p.limit_alloc && alloc_block(p, false, CUDAMALLOC_OVER_LIMIT))
++      // d. Reclaim everything else
++      || (reclaim_all(sync_event) && get_free_block(p, RECLAIM_ALL));
++
++    C10_CUDA_CHECK(cudaEventDestroy(sync_event));
++
++    return found;
+   }
+ 
+   /** allocates a block which is safe to use from the provided stream */
+-  void malloc(void** devPtr, size_t size, cudaStream_t stream)
++  Block* malloc(int device, size_t size, cudaStream_t stream, LMSSettings* lms)
+   {
+     std::lock_guard<std::recursive_mutex> lock(mutex);
+ 
+-    int device;
+-    C10_CUDA_CHECK(cudaGetDevice(&device));
+-
+     // process outstanding cudaEvents
+     process_events();
+ 
+     size = round_size(size);
+-
+-    DeviceStats &stats = get_stats_for_device(device);
+-
+-    Block search_key(device, stream, size);
+     auto& pool = get_pool(size);
+-
+-    auto find_free_block = [&]()->Block*{
+-      auto it = pool.lower_bound(&search_key);
+-      if (it != pool.end() && (*it)->device == device &&
+-          (*it)->stream == stream) {
+-        Block* block = *it;
+-        pool.erase(it);
+-        return block;
+-      }
+-      return nullptr;
+-    };
+-
+-    Block* block = find_free_block();
+-    if (block == nullptr) {
+-      bool freed_memory = false;
+-      for (const auto& name : FreeCudaMemoryCallbacksRegistry()->Keys()) {
+-        freed_memory |=
+-            FreeCudaMemoryCallbacksRegistry()->Create(name)->Execute();
+-      }
+-      if (freed_memory) {
+-        block = find_free_block();
+-      }
+-    }
+-    if (block == nullptr) {
+-      void* ptr;
+-      size_t alloc_size = get_allocation_size(size);
+-      cudaError_t err = cuda_malloc_retry(device, &ptr, alloc_size);
+-      if (err != cudaSuccess) {
+-        if (err == cudaErrorMemoryAllocation) {
+-          cudaGetLastError();  // clear CUDA error
+-
+-          size_t device_free;
+-          size_t device_total;
+-          C10_CUDA_CHECK(cudaMemGetInfo(&device_free, &device_total));
+-          const auto& stats = get_stats_for_device(device);
+-
+-          // "total capacity": total global memory on GPU
+-          // "already allocated": memory allocated by the program using the
+-          //                      caching allocator
+-          // "free": free memory as reported by the CUDA API
+-          // "cached": memory held by the allocator but not used by the program
+-          //
+-          // The "allocated" amount  does not include memory allocated outside
+-          // of the caching allocator, such as memory allocated by other programs
+-          // or memory held by the driver.
+-          //
+-          // The sum of "allocated" + "free" + "cached" may be less than the
+-          // total capacity due to memory held by the driver and usage by other
+-          // programs.
+-          //
+-          // Note that at this point cuda_malloc_retry has already returned all
+-          // possible "cached" memory to the driver. The only remaining "cached"
+-          // memory is split from a larger block that is partially in-use.
+-          AT_ERROR(
+-            "CUDA out of memory. Tried to allocate ", format_size(alloc_size),
+-            " (GPU ", device, "; ",
+-            format_size(device_total), " total capacity; ",
+-            format_size(stats.amount_allocated), " already allocated; ",
+-            format_size(device_free), " free; ",
+-            format_size(stats.amount_cached - stats.amount_allocated), " cached)");
+-        } else {
+-          C10_CUDA_CHECK(err);
+-        }
++    const size_t alloc_size = get_allocation_size(size);
++    AllocParams params(device, size, stream, &pool, alloc_size, lms, stats);
++
++    bool block_found =
++      // 1. Search pool
++      get_free_block(params, FREELIST)
++      // 2. Trigger callbacks and retry search
++      || (trigger_free_memory_callbacks(params) && get_free_block(params, FREELIST))
++      // 3. Attempt allocate (if not limited by lms settings)
++      || (!params.limit_alloc && alloc_block(params, false, CUDAMALLOC_UNDER_LIMIT))
++      // 4. If LMS enabled, try to reclaim inactive allocations
++      || (params.lms_enabled && try_lms_reclaim(params))
++      // 5. Free all non-split cached blocks and retry alloc.
++      || (free_cached_blocks() && alloc_block(params, true, CUDAMALLOC_PURGE));
++
++    AT_ASSERT((!block_found && params.err != cudaSuccess) || params.block);
++    if (!block_found) {
++      if (params.err == cudaErrorMemoryAllocation) {
++        cudaGetLastError();  // clear CUDA error
++
++        size_t device_free;
++        size_t device_total;
++        C10_CUDA_CHECK(cudaMemGetInfo(&device_free, &device_total));
++
++        // "total capacity": total global memory on GPU
++        // "already allocated": memory allocated by the program using the
++        //                      caching allocator
++        // "free": free memory as reported by the CUDA API
++        // "cached": memory held by the allocator but not used by the program
++        //
++        // The "allocated" amount  does not include memory allocated outside
++        // of the caching allocator, such as memory allocated by other programs
++        // or memory held by the driver.
++        //
++        // The sum of "allocated" + "free" + "cached" may be less than the
++        // total capacity due to memory held by the driver and usage by other
++        // programs.
++        //
++        // Note that at this point cuda_malloc_retry has already returned all
++        // possible "cached" memory to the driver. The only remaining "cached"
++        // memory is split from a larger block that is partially in-use.
++        AT_ERROR(
++          "CUDA out of memory. Tried to allocate ", format_size(alloc_size),
++          " (GPU ", device, "; ",
++          format_size(device_total), " total capacity; ",
++          format_size(stats.amount_allocated), " already allocated; ",
++          format_size(device_free), " free; ",
++          format_size(stats.amount_cached - stats.amount_allocated), " cached; ",
++          format_size(stats.amount_inactive), " inactive)");
++      } else {
++        C10_CUDA_CHECK(params.err);
+       }
+-      stats.increaseCached(alloc_size);
+-      block = new Block(device, stream, alloc_size, &pool, ptr);
+     }
+ 
++    Block* block = params.block;
+     Block* remaining = nullptr;
+     AT_ASSERT(block);
+     if (should_split(block, size)) {
+@@ -293,30 +406,19 @@ struct THCCachingAllocator
+     }
+ 
+     block->allocated = true;
+-    allocated_blocks[block->ptr] = block;
+-
+-    *devPtr = block->ptr;
+ 
+     stats.increaseAllocated(block->size);
++    stats.recordAllocSource(params.source);
++
++    return block;
+   }
+ 
+-  void free(void* ptr)
++  void free(Block* block)
+   {
+     std::lock_guard<std::recursive_mutex> lock(mutex);
+-    if (!ptr) {
+-      return;
+-    }
+-
+-    auto it = allocated_blocks.find(ptr);
+-    if (it == allocated_blocks.end()) {
+-      AT_ERROR("invalid device pointer: ", ptr);
+-    }
+-
+-    Block* block = it->second;
+-    allocated_blocks.erase(it);
+     block->allocated = false;
+ 
+-    get_stats_for_device(block->device).decreaseAllocated(block->size);
++    stats.decreaseAllocated(block->size);
+     if (!block->stream_uses.empty()) {
+       insert_events(block);
+     } else {
+@@ -328,18 +430,12 @@ struct THCCachingAllocator
+   void emptyCache()
+   {
+     std::lock_guard<std::recursive_mutex> lock(mutex);
+-    synchronize_and_free_events(nullopt);
+-    free_blocks(large_blocks, large_blocks.begin(), large_blocks.end());
+-    free_blocks(small_blocks, small_blocks.begin(), small_blocks.end());
++    free_cached_blocks();
+   }
+ 
+-  void* getBaseAllocation(void* ptr, size_t* outSize)
++  void* getBaseAllocation(Block* block, size_t* outSize)
+   {
+     std::lock_guard<std::recursive_mutex> lock(mutex);
+-    Block* block = find_allocated_block(ptr);
+-    if (!block) {
+-      AT_ERROR("invalid device pointer: ", ptr);
+-    }
+     while (block->prev) {
+       block = block->prev;
+     }
+@@ -356,11 +452,9 @@ struct THCCachingAllocator
+   }
+ 
+   // Accumulates sizes of all memory blocks for given device in given pool
+-  void cacheInfoAux(BlockPool& blocks, int dev_id, size_t* total, size_t* largest)
++  void cacheInfoAux(BlockPool& blocks, size_t* total, size_t* largest)
+   {
+-    Block search_key(dev_id, 0, 0);
+-    auto it = blocks.lower_bound(&search_key);
+-    for (; it != blocks.end() && *it && (*it)->device == dev_id; ++it) {
++    for (auto it = blocks.begin(); it != blocks.end(); ++it) {
+       size_t blocksize = (*it)->size;
+       *total += blocksize;
+       if (blocksize > *largest) {
+@@ -369,31 +463,22 @@ struct THCCachingAllocator
+     }
+   }
+ 
+-  void cacheInfo(int dev_id, size_t* total, size_t* largest)
++  void cacheInfo(size_t* total, size_t* largest)
+   {
+     std::lock_guard<std::recursive_mutex> lock(mutex);
+-    cacheInfoAux(large_blocks, dev_id, total, largest);
+-    cacheInfoAux(small_blocks, dev_id, total, largest);
++    cacheInfoAux(large_blocks, total, largest);
++    cacheInfoAux(small_blocks, total, largest);
+   }
+ 
+-  void recordStream(void* ptr, cuda::CUDAStream stream)
++  void recordStream(Block* block, cuda::CUDAStream stream)
+   {
+-    // Empty tensor's storage().data() might be a null ptr. As there is no
+-    // blocks associated with those tensors, it is fine to do nothing here.
+-    if (ptr) {
+-      std::lock_guard<std::recursive_mutex> lock(mutex);
+-      Block* block = find_allocated_block(ptr);
+-      // block could be nullptr in some cases, e.g., tensor loaded from blob, or
+-      // shared from another process, or not pointing to a CUDA tensor.
+-      if (block) {
+-        if (stream.stream() == block->stream) {
+-          // ignore uses on the allocation stream, since those don't require any
+-          // special synchronization
+-          return;
+-        }
+-        block->stream_uses.insert(stream);
+-      }
++    std::lock_guard<std::recursive_mutex> lock(mutex);
++    if (stream.stream() == block->stream) {
++      // ignore uses on the allocation stream, since those don't require any
++      // special synchronization
++      return;
+     }
++    block->stream_uses.insert(stream);
+   }
+ 
+   /** moves a block into a pool of cached free blocks */
+@@ -448,7 +533,7 @@ struct THCCachingAllocator
+     }
+   }
+ 
+-  size_t round_size(size_t size) {
++  static size_t round_size(size_t size) {
+     if (size < kMinBlockSize) {
+       return kMinBlockSize;
+     } else {
+@@ -456,7 +541,7 @@ struct THCCachingAllocator
+     }
+   }
+ 
+-  size_t get_allocation_size(size_t size) {
++  static size_t get_allocation_size(size_t size) {
+     if (size <= kSmallSize) {
+       return kSmallBuffer;
+     } else if (size < kMinLargeAlloc) {
+@@ -466,51 +551,28 @@ struct THCCachingAllocator
+     }
+   }
+ 
+-  cudaError_t cuda_malloc_retry(int device, void** devPtr, size_t size)
+-  {
+-    // Try cudaMalloc. If cudaMalloc fails, frees all non-split cached blocks
+-    // and retries.
+-    cudaError_t err = cudaMalloc(devPtr, size);
+-    if (err != cudaSuccess) {
+-      cudaGetLastError();  // reset the last CUDA error
+-      free_cached_blocks(device);
+-      err = cudaMalloc(devPtr, size);
+-      if (err != cudaSuccess) {
+-        return err;
+-      }
+-    }
+-    return cudaSuccess;
+-  }
+-
+-  void free_cached_blocks(int device)
++  bool free_cached_blocks()
+   {
+     // First ensure that all blocks that can't currently be allocated due to
+     // outstanding events are returned to the pool.
+-    synchronize_and_free_events(device);
++    synchronize_and_free_events();
+ 
+-    // Free all non-split cached blocks on device
+-    Block lower_bound(device, nullptr, 0);
+-    Block upper_bound(device + 1, nullptr, 0);
+-
+-    free_blocks(
+-        large_blocks,
+-        large_blocks.lower_bound(&lower_bound),
+-        large_blocks.lower_bound(&upper_bound));
+-    free_blocks(
+-        small_blocks,
+-        small_blocks.lower_bound(&lower_bound),
+-        small_blocks.lower_bound(&upper_bound));
++    // Free all non-split cached blocks
++    free_blocks(large_blocks);
++    free_blocks(small_blocks);
++    return true;
+   }
+ 
+-  void free_blocks(BlockPool& blocks, BlockPool::iterator it, BlockPool::iterator end)
++  void free_blocks(BlockPool& blocks)
+   {
+-    // Frees all non-split blocks between `it` and `end`
+-    std::lock_guard<std::mutex> lock(cuda_free_mutex);
+-    while (it != end) {
++    // Frees all non-split blocks
++    std::lock_guard<std::mutex> lock(*CUDACachingAllocator::getFreeMutex());
++    auto it = blocks.begin();
++    while (it != blocks.end()) {
+       Block* block = *it;
+       if (!block->prev && !block->next) {
+         C10_CUDA_CHECK(cudaFree((void*)block->ptr));
+-        get_stats_for_device(block->device).decreaseCached(block->size);
++        stats.decreaseCached(block->size);
+         auto cur = it;
+         ++it;
+         blocks.erase(cur);
+@@ -521,19 +583,12 @@ struct THCCachingAllocator
+     }
+   }
+ 
+-  void synchronize_and_free_events(optional<int> device) {
++  void synchronize_and_free_events() {
+     // Synchronize on outstanding events and then free associated blocks.
+-    // Limited to blocks on the given device if specified.
+-
+-    auto remaining_events = decltype(cuda_events)();
+ 
+     for (auto& e : cuda_events) {
+       cudaEvent_t event = e.first;
+       Block* block = e.second;
+-      if (device.has_value() && block->device != *device) {
+-        remaining_events.push_back(e);
+-        continue;
+-      }
+ 
+       C10_CUDA_CHECK(cudaEventSynchronize(event));
+       C10_CUDA_CHECK(cudaEventDestroy(event));
+@@ -544,15 +599,7 @@ struct THCCachingAllocator
+       }
+     }
+ 
+-    std::swap(cuda_events, remaining_events);
+-  }
+-
+-  Block* find_allocated_block(void *ptr) {
+-    auto it = allocated_blocks.find(ptr);
+-    if (it == allocated_blocks.end()) {
+-      return nullptr;
+-    }
+-    return it->second;
++    cuda_events.clear();
+   }
+ 
+   void insert_events(Block* block)
+@@ -606,10 +653,296 @@ struct THCCachingAllocator
+       cuda_events.pop_front();
+     }
+   }
++
++  void reclaim_list_add(StorageImpl* storage) {
++    std::lock_guard<std::recursive_mutex> lock(mutex);
++    size_t storage_size = round_size(storage->capacity());
++    stats.increaseInactive(storage_size);
++    storage->lms_list_add(&reclaim_list);
++  }
++
++  bool reclaim_list_remove(StorageImpl* storage) {
++    std::lock_guard<std::recursive_mutex> lock(mutex);
++    if (!storage->lms_list_remove())
++      return false;
++
++    size_t storage_size = round_size(storage->capacity());
++    stats.decreaseInactive(storage_size);
++    return true;
++  }
++
++  bool reclaim_one(size_t size, cudaEvent_t sync_event) {
++    StorageImpl *best = nullptr;
++    size_t best_size = ULONG_MAX;
++
++    if (!reclaim_list.empty()) {
++      auto hook = reclaim_list.head();
++      auto end = reclaim_list.terminator();
++      do {
++        StorageImpl *storage = at::StorageImpl::from_list_hook(hook);
++        hook = hook->next();
++
++        size_t storage_size = round_size(storage->capacity());
++        if (storage_size >= size && storage_size < best_size) {
++          best = storage;
++          best_size = storage_size;
++          if (storage_size == size)
++            break;
++        }
++      } while (hook != end);
++    }
++
++    if (best == nullptr)
++      return false;
++
++    stats.decreaseInactive(best_size, true);
++    best->lms_list_remove();
++    best->lms_pageout(sync_event);
++    best->lms_pageout_sync();
++    return true;
++  }
++
++  static inline void process_pageout_sync(at::IntrusiveList* iodone_queue) {
++    while (!iodone_queue->empty()) {
++      auto hook = iodone_queue->head();
++      StorageImpl *storage = at::StorageImpl::from_list_hook(hook);
++      storage->lms_pageout_sync(iodone_queue);
++    }
++  }
++
++  bool reclaim_fragments(size_t size, cudaEvent_t sync_event) {
++    at::IntrusiveList iodone_queue;
++    size_t alloc_size;
++    int count = 0;
++
++    if (!reclaim_list.empty()) {
++      auto hook = reclaim_list.head();
++      auto end = reclaim_list.terminator();
++      do {
++        StorageImpl *storage = at::StorageImpl::from_list_hook(hook);
++        hook = hook->next();
++
++        CUDACachingAllocator::getBaseAllocation(storage->allocation_ptr(), &alloc_size);
++        if (alloc_size >= size) {
++          size_t storage_size = round_size(storage->capacity());
++          stats.decreaseInactive(storage_size, true);
++          storage->lms_list_remove();
++          storage->lms_pageout(sync_event, &iodone_queue);
++          count++;
++        }
++      } while (hook != end);
++    }
++
++    if (count == 0)
++      return false;
++
++    process_pageout_sync(&iodone_queue);
++    return true;
++  }
++
++  bool reclaim_all(cudaEvent_t sync_event) {
++    at::IntrusiveList iodone_queue;
++    int count = 0;
++
++    if (!reclaim_list.empty()) {
++      auto hook = reclaim_list.head();
++      auto end = reclaim_list.terminator();
++      do {
++        StorageImpl *storage = at::StorageImpl::from_list_hook(hook);
++        hook = hook->next();
++
++        size_t storage_size = round_size(storage->capacity());
++        stats.decreaseInactive(storage_size, true);
++        storage->lms_list_remove();
++        storage->lms_pageout(sync_event, &iodone_queue);
++        count++;
++      } while (hook != end);
++    }
++
++    if (count == 0)
++      return false;
++
++    process_pageout_sync(&iodone_queue);
++    return true;
++  }
++
++  void reclaimInactive()
++  {
++    std::lock_guard<std::recursive_mutex> lock(mutex);
++
++    if (!reclaim_list.empty()) {
++      cudaStream_t stream = cuda::getCurrentCUDAStream().stream();
++      cudaEvent_t sync_event;
++
++      C10_CUDA_CHECK(cudaEventCreate(&sync_event));
++      C10_CUDA_CHECK(cudaEventRecord(sync_event, stream));
++      reclaim_all(sync_event);
++      C10_CUDA_CHECK(cudaEventDestroy(sync_event));
++    }
++  }
++};
++
++struct THCCachingAllocator {
++  std::mutex mutex;
++  std::vector<DeviceCachingAllocator*> device_allocator;
++
++  // allocated blocks by device pointer
++  std::unordered_map<void*, Block*> allocated_blocks;
++
++  // lock around calls to cudaFree (to prevent deadlocks with NCCL)
++  std::mutex cuda_free_mutex;
++
++  LMSSettings lms_settings;
++
++  void init(int device_count, at::Allocator* host_allocator) {
++    int size = device_allocator.size();
++    if (size < device_count) {
++      device_allocator.resize(device_count);
++      for (int i = size; i < device_count; i++) {
++        device_allocator[i] = new DeviceCachingAllocator();
++      }
++    }
++    lms_settings.set_host_allocator(host_allocator);
++  }
++
++  void malloc(void** devPtr, size_t size, cudaStream_t stream) {
++    int device;
++    C10_CUDA_CHECK(cudaGetDevice(&device));
++    Block* block = device_allocator[device]->malloc(device, size, stream, &lms_settings);
++    {
++      std::lock_guard<std::mutex> lock(mutex);
++      allocated_blocks[block->ptr] = block;
++    }
++    *devPtr = (void*)block->ptr;
++  }
++
++  void free(void* ptr) {
++    if (!ptr) {
++      return;
++    }
++    Block* block = nullptr;
++    {
++      std::lock_guard<std::mutex> lock(mutex);
++      auto it = allocated_blocks.find(ptr);
++      if (it == allocated_blocks.end()) {
++        AT_ERROR("invalid device pointer: ", ptr);
++      }
++      block = it->second;
++      allocated_blocks.erase(it);
++    }
++    device_allocator[block->device]->free(block);
++  }
++
++  void emptyCache() {
++    int count = device_allocator.size();
++    for (int i = 0; i < count; i++)
++      device_allocator[i]->emptyCache();
++  }
++
++  Block* find_allocated_block(void *ptr) {
++    std::lock_guard<std::mutex> lock(mutex);
++    auto it = allocated_blocks.find(ptr);
++    if (it == allocated_blocks.end()) {
++      return nullptr;
++    }
++    return it->second;
++  }
++
++  void* getBaseAllocation(void* ptr, size_t* outSize)
++  {
++    Block* block = find_allocated_block(ptr);
++    if (!block) {
++      AT_ERROR("invalid device pointer: ", ptr);
++    }
++    return device_allocator[block->device]->getBaseAllocation(block, outSize);
++  }
++
++  void recordStream(void* ptr, cuda::CUDAStream stream)
++  {
++    // Empty tensor's storage().data() might be a null ptr. As there is no
++    // blocks associated with those tensors, it is fine to do nothing here.
++    if (ptr) {
++      Block* block = find_allocated_block(ptr);
++      // block could be nullptr in some cases, e.g., tensor loaded from blob, or
++      // shared from another process, or not pointing to a CUDA tensor.
++      if (block) {
++        device_allocator[block->device]->recordStream(block, stream);
++      }
++    }
++  }
++
++  void cacheInfo(int dev_id, size_t* total, size_t* largest) {
++    device_allocator[dev_id]->cacheInfo(total, largest);
++  }
++
++  void reclaimInactive() {
++    int count = device_allocator.size();
++    for (int i = 0; i < count; i++)
++      device_allocator[i]->reclaimInactive();
++  }
+ };
+ 
+ THCCachingAllocator caching_allocator;
+ 
++
++#define LMS_INVALID_STREAM ((cudaStream_t)-1)
++
++struct CudaLMSImpl : public at::LMSImpl {
++  CudaLMSImpl() :
++    at::LMSImpl(caching_allocator.lms_settings.host_allocator()),
++    stream_(LMS_INVALID_STREAM) {}
++  ~CudaLMSImpl() {}
++
++  void reclaim_list_add(at::IntrusiveListHook* hook) {
++    at::StorageImpl* storage = at::StorageImpl::from_list_hook(hook);
++    size_t size = storage->capacity();
++    size_t storage_size = DeviceCachingAllocator::round_size(size);
++    if (size == 0 || !caching_allocator.lms_settings.enabled(storage_size))
++      return;
++    int device = storage->device().index();
++    caching_allocator.device_allocator[device]->reclaim_list_add(storage);
++  }
++
++  bool reclaim_list_remove(at::IntrusiveListHook* hook) {
++    at::StorageImpl* storage = at::StorageImpl::from_list_hook(hook);
++    int device = storage->device().index();
++    return caching_allocator.device_allocator[device]->reclaim_list_remove(storage);
++  }
++
++ protected:
++  cudaStream_t stream() const {
++    AT_ASSERT(stream_ != LMS_INVALID_STREAM);
++    return stream_;
++  }
++
++  void assign_stream() {
++    if (stream_ == LMS_INVALID_STREAM) {
++      stream_ = cuda::getLMSCUDAStream().stream();
++    }
++  }
++
++  void do_pagein(void* dst, void* src, size_t size) {
++    C10_CUDA_CHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyHostToDevice, stream()));
++  }
++
++  void do_pagein_sync() {
++    C10_CUDA_CHECK(cudaStreamSynchronize(stream()));
++  }
++
++  void do_pageout(void* dst, void* src, size_t size, at::LMSSyncEvent_t sync_event) {
++    assign_stream();
++    C10_CUDA_CHECK(cudaStreamWaitEvent(stream(), (cudaEvent_t)sync_event, 0));
++    C10_CUDA_CHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToHost, stream()));
++  }
++
++  void do_pageout_sync() {
++    C10_CUDA_CHECK(cudaStreamSynchronize(stream()));
++  }
++
++  cudaStream_t stream_;
++};
++
++
+ static void CudaCachingDeleter(void* ptr) {
+   caching_allocator.free(ptr);
+ }
+@@ -630,6 +963,9 @@ struct CudaCachingAllocator : public Allocator {
+   DeleterFnPtr raw_deleter() const override {
+     return &CudaCachingDeleter;
+   }
++  at::LMSImpl* lms() const {
++    return caching_allocator.lms_settings.enabled() ? new CudaLMSImpl() : nullptr;
++  }
+ };
+ 
+ CudaCachingAllocator device_allocator;
+@@ -639,6 +975,10 @@ Allocator* get(void)
+   return &device_allocator;
+ }
+ 
++void init(int device_count, at::Allocator* host_allocator) {
++  caching_allocator.init(device_count, host_allocator);
++}
++
+ void emptyCache(void) {
+   caching_allocator.emptyCache();
+ }
+@@ -670,37 +1010,107 @@ static inline void assertValidDevice(int device) {
+ uint64_t currentMemoryAllocated(int device)
+ {
+   assertValidDevice(device);
+-  return caching_allocator.get_stats_for_device(device).amount_allocated;
++  return caching_allocator.device_allocator[device]->stats.amount_allocated;
+ }
+ 
+ uint64_t maxMemoryAllocated(int device) {
+   assertValidDevice(device);
+-  return caching_allocator.get_stats_for_device(device).max_amount_allocated;
++  return caching_allocator.device_allocator[device]->stats.max_amount_allocated;
+ }
+ 
+ void resetMaxMemoryAllocated(int device) {
+   assertValidDevice(device);
+-  DeviceStats& stats = caching_allocator.get_stats_for_device(device);
++  DeviceStats& stats = caching_allocator.device_allocator[device]->stats;
+   stats.max_amount_allocated = stats.amount_allocated;
+ }
+ 
+ uint64_t currentMemoryCached(int device)
+ {
+   assertValidDevice(device);
+-  return caching_allocator.get_stats_for_device(device).amount_cached;
++  return caching_allocator.device_allocator[device]->stats.amount_cached;
+ }
+ 
+ uint64_t maxMemoryCached(int device) {
+   assertValidDevice(device);
+-  return caching_allocator.get_stats_for_device(device).max_amount_cached;
++  return caching_allocator.device_allocator[device]->stats.max_amount_cached;
+ }
+ 
+ void resetMaxMemoryCached(int device) {
+   assertValidDevice(device);
+-  DeviceStats& stats = caching_allocator.get_stats_for_device(device);
++  DeviceStats& stats = caching_allocator.device_allocator[device]->stats;
+   stats.max_amount_cached = stats.amount_cached;
+ }
+ 
++uint64_t currentMemoryActive(int device)
++{
++  assertValidDevice(device);
++  return caching_allocator.device_allocator[device]->stats.amount_active();
++}
++
++uint64_t maxMemoryActive(int device) {
++  assertValidDevice(device);
++  return caching_allocator.device_allocator[device]->stats.max_amount_active;
++}
++
++void resetMaxMemoryActive(int device) {
++  assertValidDevice(device);
++  DeviceStats& stats = caching_allocator.device_allocator[device]->stats;
++  stats.max_amount_active = stats.amount_active();
++}
++
++uint64_t currentMemoryReclaimed(int device)
++{
++  assertValidDevice(device);
++  return caching_allocator.device_allocator[device]->stats.amount_reclaimed;
++}
++
++void resetMemoryReclaimed(int device) {
++  assertValidDevice(device);
++  DeviceStats& stats = caching_allocator.device_allocator[device]->stats;
++  stats.amount_reclaimed = 0;
++}
++
++void currentAllocDistribution(int device, uint64_t* distribution)
++{
++  assertValidDevice(device);
++  DeviceStats& stats = caching_allocator.device_allocator[device]->stats;
++  stats.getAllocStats(distribution);
++}
++
++void resetAllocDistribution(int device) {
++  assertValidDevice(device);
++  DeviceStats& stats = caching_allocator.device_allocator[device]->stats;
++  stats.resetAllocStats();
++}
++
++void setUserEnabledLMS(bool enable) {
++  caching_allocator.lms_settings.set_enabled(enable);
++}
++
++bool userEnabledLMS(void) {
++  return caching_allocator.lms_settings.enabled();
++}
++
++void setUserSizeLMS(size_t size) {
++  caching_allocator.lms_settings.set_size(size);
++}
++
++size_t userSizeLMS(void) {
++  return caching_allocator.lms_settings.size();
++}
++
++void setUserLimitLMS(size_t limit) {
++  caching_allocator.lms_settings.set_limit(limit);
++}
++
++size_t userLimitLMS(void) {
++  return caching_allocator.lms_settings.limit();
++}
++
++void reclaimInactive(void) {
++  caching_allocator.reclaimInactive();
++}
++
+ //
+ // In CUDA IPC, sender sends a tensor to receiver, getIpcDevPtr
+ // is called by the receiving process to map the CUDA memory from the sending
+diff --git a/c10/cuda/CUDACachingAllocator.h b/c10/cuda/CUDACachingAllocator.h
+index 2376446a6f..21eed40c8d 100644
+--- a/c10/cuda/CUDACachingAllocator.h
++++ b/c10/cuda/CUDACachingAllocator.h
+@@ -3,6 +3,7 @@
+ 
+ #include <c10/cuda/CUDAStream.h>
+ #include <c10/core/Allocator.h>
++#include <c10/core/StorageImpl.h>
+ #include <c10/cuda/CUDAMacros.h>
+ #include <c10/util/Registry.h>
+ 
+@@ -43,6 +44,7 @@ C10_CUDA_API void* raw_alloc(size_t nbytes);
+ C10_CUDA_API void raw_delete(void* ptr);
+ 
+ C10_CUDA_API Allocator* get();
++C10_CUDA_API void init(int device_count, at::Allocator* host_allocator);
+ C10_CUDA_API void emptyCache();
+ C10_CUDA_API void cacheInfo(int dev_id, size_t* cachedAndFree, size_t* largestBlock);
+ C10_CUDA_API void* getBaseAllocation(void *ptr, size_t *size);
+@@ -53,11 +55,37 @@ C10_CUDA_API void     resetMaxMemoryAllocated(int device);
+ C10_CUDA_API uint64_t currentMemoryCached(int device);
+ C10_CUDA_API uint64_t maxMemoryCached(int device);
+ C10_CUDA_API void     resetMaxMemoryCached(int device);
++C10_CUDA_API uint64_t currentMemoryActive(int device);
++C10_CUDA_API uint64_t maxMemoryActive(int device);
++C10_CUDA_API void     resetMaxMemoryActive(int device);
++C10_CUDA_API uint64_t currentMemoryReclaimed(int device);
++C10_CUDA_API void     resetMemoryReclaimed(int device);
++C10_CUDA_API void   setUserEnabledLMS(bool enable);
++C10_CUDA_API bool   userEnabledLMS(void);
++C10_CUDA_API void   setUserSizeLMS(size_t size);
++C10_CUDA_API size_t userSizeLMS(void);
++C10_CUDA_API void   setUserLimitLMS(size_t limit);
++C10_CUDA_API size_t userLimitLMS(void);
++C10_CUDA_API void reclaimInactive();
+ 
+ C10_CUDA_API std::mutex* getFreeMutex();
+ 
+ C10_CUDA_API std::shared_ptr<void> getIpcDevPtr(std::string handle);
+ 
++enum AllocSource {
++  FREELIST,
++  CUDAMALLOC_UNDER_LIMIT,
++  RECLAIM_ONE,
++  RECLAIM_FRAGMENTS,
++  CUDAMALLOC_OVER_LIMIT,
++  RECLAIM_ALL,
++  CUDAMALLOC_PURGE,
++  NUM_ALLOC_SOURCES
++};
++
++C10_CUDA_API void currentAllocDistribution(int device, uint64_t* distribution);
++C10_CUDA_API void resetAllocDistribution(int device);
++
+ } // namespace CUDACachingAllocator
+ 
+ }} // namespace c10::cuda
+diff --git a/c10/cuda/CUDAStream.cpp b/c10/cuda/CUDAStream.cpp
+index 393826f75a..01e12ff83d 100644
+--- a/c10/cuda/CUDAStream.cpp
++++ b/c10/cuda/CUDAStream.cpp
+@@ -73,6 +73,13 @@ static std::array<LeakyStreamInternals, kStreamsPerPool>
+ static std::array<LeakyStreamInternals, kStreamsPerPool>
+     high_priority_streams[C10_COMPILE_TIME_MAX_GPUS];
+ 
++// LMS streams
++static constexpr unsigned int kLMSFlags = cudaStreamDefault;
++static std::once_flag device_flags_lms[C10_COMPILE_TIME_MAX_GPUS];
++static std::atomic<uint32_t> lms_counters[C10_COMPILE_TIME_MAX_GPUS];
++static std::array<LeakyStreamInternals, kStreamsPerPool>
++    lms_streams[C10_COMPILE_TIME_MAX_GPUS];
++
+ // Note [StreamId assignment]
+ // ~~~~~~~~~~~~~~~~~~~~~~~~~~
+ // How do we assign stream IDs?
+@@ -84,6 +91,7 @@ static std::array<LeakyStreamInternals, kStreamsPerPool>
+ //  00 = default stream
+ //  01 = low priority stream
+ //  10 = high priority stream
++//  11 = LMS stream
+ //
+ // This is not really for efficiency; it's just easier to write the code
+ // to extract the index if we do this with bitmasks :)
+@@ -104,6 +112,7 @@ enum class StreamIdType : uint8_t {
+   DEFAULT = 0x0,
+   LOW = 0x1,
+   HIGH = 0x2,
++  LMS = 0x3,
+ };
+ 
+ std::ostream& operator<<(std::ostream& stream, StreamIdType s) {
+@@ -117,6 +126,9 @@ std::ostream& operator<<(std::ostream& stream, StreamIdType s) {
+     case StreamIdType::HIGH:
+       stream << "HIGH";
+       break;
++    case StreamIdType::LMS:
++      stream << "LMS";
++      break;
+     default:
+       stream << static_cast<uint8_t>(s);
+       break;
+@@ -178,6 +190,13 @@ static StreamId CUDAStream_getStreamId(const LeakyStreamInternals* ptr) {
+         StreamIdType::HIGH, ptr - high_priority_streams[device_index].data());
+   }
+ 
++  // Check if it's a LMS stream
++  if (pointer_within<LeakyStreamInternals>(
++          ptr, lms_streams[device_index])) {
++    return makeStreamId(
++        StreamIdType::LMS, ptr - lms_streams[device_index].data());
++  }
++
+   AT_ASSERTM(
+       0,
+       "Could not compute stream ID for ",
+@@ -243,6 +262,21 @@ static void initDeviceStreamState(DeviceIndex device_index) {
+   }
+ }
+ 
++// Creates the LMS stream pools for the specified device
++// Warning: only call once per device!
++static void initDeviceLMSStreamState(DeviceIndex device_index) {
++  // Switches to the requested device so streams are properly associated
++  // with it.
++  CUDAGuard device_guard{device_index};
++
++  for (auto i = decltype(kStreamsPerPool){0}; i < kStreamsPerPool; ++i) {
++    auto& stream = lms_streams[device_index][i];
++
++    stream.device_index = device_index;
++    C10_CUDA_CHECK(cudaStreamCreateWithFlags(&stream.stream, kLMSFlags));
++  }
++}
++
+ // Init front-end to ensure initialization only occurs once
+ static void initCUDAStreamsOnce() {
+   // Inits default streams (once, globally)
+@@ -293,6 +327,8 @@ LeakyStreamInternals* CUDAStream_internals(CUDAStream s) {
+       return &low_priority_streams[device_index][si];
+     case StreamIdType::HIGH:
+       return &high_priority_streams[device_index][si];
++    case StreamIdType::LMS:
++      return &lms_streams[device_index][si];
+     default:
+       AT_ASSERTM(
+           0,
+@@ -369,6 +405,20 @@ void setCurrentCUDAStream(CUDAStream stream) {
+   current_streams[ptr->device_index] = ptr;
+ }
+ 
++CUDAStream getLMSCUDAStream(DeviceIndex device_index) {
++  initCUDAStreamsOnce();
++  if (device_index == -1)
++    device_index = current_device();
++  check_gpu(device_index);
++
++  // Initializes the LMS stream pool (once)
++  std::call_once(
++      device_flags_lms[device_index], initDeviceLMSStreamState, device_index);
++
++  const auto idx = get_idx(lms_counters[device_index]);
++  return CUDAStream_fromInternals(&lms_streams[device_index][idx]);
++}
++
+ std::ostream& operator<<(std::ostream& stream, const CUDAStream& s) {
+   return stream << s.unwrap();
+ }
+diff --git a/c10/cuda/CUDAStream.h b/c10/cuda/CUDAStream.h
+index b23f8aa1c6..0e601e8872 100644
+--- a/c10/cuda/CUDAStream.h
++++ b/c10/cuda/CUDAStream.h
+@@ -213,6 +213,11 @@ CAFFE2_API CUDAStream getCurrentCUDAStream(DeviceIndex device_index = -1);
+  */
+ CAFFE2_API void setCurrentCUDAStream(CUDAStream stream);
+ 
++/**
++ * Get a new stream from the CUDA stream pool for LMS.
++ */
++CAFFE2_API CUDAStream getLMSCUDAStream(DeviceIndex device = -1);
++
+ C10_API std::ostream& operator<<(std::ostream& stream, const CUDAStream& s);
+ 
+ } // namespace cuda
+diff --git a/c10/util/IntrusiveList.h b/c10/util/IntrusiveList.h
+new file mode 100644
+index 0000000000..7e895416f4
+--- /dev/null
++++ b/c10/util/IntrusiveList.h
+@@ -0,0 +1,64 @@
++//===--- IntrusiveList.h - --------------------------------------*- C++ -*-===//
++
++#pragma once
++
++#include "c10/util/Exception.h"
++
++namespace c10 {
++  class IntrusiveListHook {
++  public:
++    IntrusiveListHook() {
++      next_ = prev_ = this;
++    }
++    ~IntrusiveListHook() {
++      remove();
++    }
++
++    IntrusiveListHook(IntrusiveListHook&& other) : IntrusiveListHook() {}
++    IntrusiveListHook& operator=(IntrusiveListHook&& other) { return *this; }
++
++    bool attached() const { return next_ != this; }
++    bool detached() const { return next_ == this; }
++
++    void insertbefore(IntrusiveListHook *x) {
++      if (x->attached()) {
++        AT_ERROR("Double insertion of IntrusiveListHook");
++      }
++      x->prev_ = prev_;
++      x->next_ = this;
++      prev_->next_ = x;
++      prev_ = x;
++    }
++
++    bool remove() {
++      if (!attached()) return false;
++
++      prev_->next_ = next_;
++      next_->prev_ = prev_;
++      next_ = prev_ = this;
++      return true;
++    }
++    IntrusiveListHook *next() const { return next_; }
++    IntrusiveListHook *prev() const { return prev_; }
++
++  private:
++    IntrusiveListHook *next_;
++    IntrusiveListHook *prev_;
++  };
++
++  class IntrusiveList {
++  public:
++    IntrusiveList() {}
++    ~IntrusiveList() {}
++    bool empty() const { return anchor_.detached(); }
++    void append(IntrusiveListHook *x) { anchor_.insertbefore(x); }
++    void prepend(IntrusiveListHook *x) { anchor_.next()->insertbefore(x); }
++    IntrusiveListHook *head() const { return anchor_.next(); }
++    IntrusiveListHook *tail() const { return anchor_.prev(); }
++    const IntrusiveListHook *terminator() const { return &anchor_; }
++
++  private:
++    IntrusiveListHook anchor_;
++  };
++
++} // end namespace c10
+diff --git a/test/test_cuda.py b/test/test_cuda.py
+index bc159a432d..a10e33a59d 100644
+--- a/test/test_cuda.py
++++ b/test/test_cuda.py
+@@ -2938,6 +2938,122 @@ class TestCuda(TestCase):
+             torch.DoubleTensor(a).cuda().round().cpu(),
+             torch.DoubleTensor(res).cpu())
+ 
++    def test_large_model_support(self):
++        device = torch.cuda.current_device()
++        default_enabled = torch.cuda.get_enabled_lms()
++        default_size = torch.cuda.get_size_lms()
++        default_limit = torch.cuda.get_limit_lms()
++
++        def alloc(*size):
++            with torch.cuda.device(device):
++                return torch.cuda.FloatTensor(*size).normal_()
++
++        # 1. Test Inactive LMS Off
++        #    LMS Off / alloc multiple small and large
++        #    assert(active memory == allocated memory)
++        # 2. Test Inactive LMS On
++        #    LMS On  / alloc multiple small and large
++        #    assert(active memory < allocated memory)
++        def _test_lms_enabled(enabled):
++            torch.cuda.empty_cache()
++            torch.cuda.set_enabled_lms(enabled)
++            tensors = [alloc(32), alloc(128), alloc(10, 1024, 1024)]
++            if not enabled:
++                self.assertEqual(torch.cuda.memory_allocated(device), torch.cuda.memory_active(device))
++            else:
++                self.assertGreater(torch.cuda.memory_allocated(device), torch.cuda.memory_active(device))
++            del tensors
++
++        _test_lms_enabled(enabled=False)
++        _test_lms_enabled(enabled=True)
++
++        # 3. Test LMS Limit Swap
++        #    LMS On, limit 0 / alloc multiple small and large / record memory stats / alloc large
++        #    assert(allocated is unchanged)
++        # 4. Test LMS Limit Alloc
++        #    LMS On, limit high / alloc multiple small and large / record memory stats / alloc large
++        #    assert(allocated has increased)
++        def _test_lms_limit(zero):
++            torch.cuda.empty_cache()
++            torch.cuda.set_limit_lms(0 if zero else 1024*1024*1024)
++            tensors = [alloc(32), alloc(128), alloc(10, 1024, 1024)]
++            allocated = torch.cuda.memory_allocated(device)
++            reclaimed = torch.cuda.memory_reclaimed(device)
++            dist_before = torch.cuda.alloc_distribution(device)
++            tensors.append(alloc(10, 1024, 1024))
++            dist_after = torch.cuda.alloc_distribution(device)
++            if zero:
++                self.assertEqual(torch.cuda.memory_allocated(device), allocated)
++                self.assertGreater(torch.cuda.memory_reclaimed(device), reclaimed)
++                self.assertEqual(dist_after['cudamalloc'], dist_before['cudamalloc'])
++                self.assertGreater(dist_after['reclaim_one'], dist_before['reclaim_one'])
++            else:
++                self.assertGreater(torch.cuda.memory_allocated(device), allocated)
++                self.assertEqual(torch.cuda.memory_reclaimed(device), reclaimed)
++                self.assertGreater(dist_after['cudamalloc'], dist_before['cudamalloc'])
++                self.assertEqual(dist_after['reclaim_one'], dist_before['reclaim_one'])
++            del tensors
++
++        _test_lms_limit(zero=True)
++        _test_lms_limit(zero=False)
++        torch.cuda.set_limit_lms(default_limit)
++
++        # 5. Test LMS Size Threshold On
++        #    LMS On, size 1MB / record memory stats / alloc multple small and large
++        #    assert(active memory has increased)
++        # 6. Test LMS Size Threshold Off
++        #    LMS On, size 0 / record memory stats / alloc multiple small and large
++        #    assert(active memory is unchanged)
++        def _test_lms_size(zero):
++            torch.cuda.empty_cache()
++            torch.cuda.set_size_lms(0 if zero else 1024*1024)
++            active = torch.cuda.memory_active(device)
++            tensors = [alloc(32), alloc(128), alloc(10, 1024, 1024)]
++            if zero:
++                self.assertEqual(torch.cuda.memory_active(device), active)
++            else:
++                self.assertGreater(torch.cuda.memory_active(device), active)
++            del tensors
++
++        _test_lms_size(zero=False)
++        _test_lms_size(zero=True)
++        torch.cuda.set_size_lms(default_size)
++
++        # 7. Test LMS Page-out
++        #    LMS On / alloc multiple small and large / record memory stats / reclaim all
++        #    assert(allocated has decreased && active/cached are unchanged)
++        torch.cuda.empty_cache()
++        tensors = [alloc(32), alloc(128), alloc(10, 1024, 1024)]
++        sums = list(map(torch.sum, tensors))
++        cached = torch.cuda.memory_cached(device)
++        allocated = torch.cuda.memory_allocated(device)
++        active = torch.cuda.memory_active(device)
++        reclaimed = torch.cuda.memory_reclaimed(device)
++        torch.cuda.reclaim_inactive()
++        self.assertGreater(torch.cuda.memory_reclaimed(device), reclaimed)
++        self.assertEqual(active, torch.cuda.memory_active(device))
++        self.assertEqual(cached, torch.cuda.memory_cached(device))
++        self.assertGreater(allocated, torch.cuda.memory_allocated(device))
++
++        # 8. Test LMS Page-in
++        #    Access tensors again
++        #    assert(tensor data is preserved during reclaim)
++        #    assert(allocated been restored && active/cached are still unchanged)
++        dist_before = torch.cuda.alloc_distribution(device)
++        sums2 = list(map(torch.sum, tensors))
++        dist_after = torch.cuda.alloc_distribution(device)
++        self.assertEqual(sums, sums2)
++        del sums2
++        self.assertEqual(active, torch.cuda.memory_active(device))
++        self.assertEqual(cached, torch.cuda.memory_cached(device))
++        self.assertEqual(allocated, torch.cuda.memory_allocated(device))
++        self.assertGreater(dist_after['freelist'], dist_before['freelist'])
++        self.assertEqual(dist_after['cudamalloc'], dist_before['cudamalloc'])
++        del sums
++        del tensors
++
++        # Reset LMS state
++        torch.cuda.set_enabled_lms(default_enabled)
+ 
+ def load_ignore_file():
+     from os.path import join, dirname
+diff --git a/torch/csrc/cuda/Module.cpp b/torch/csrc/cuda/Module.cpp
+index 6998601c7d..29ac45e407 100644
+--- a/torch/csrc/cuda/Module.cpp
++++ b/torch/csrc/cuda/Module.cpp
+@@ -295,6 +295,151 @@ PyObject * THCPModule_resetMaxMemoryCached(PyObject *_unused, PyObject *arg)
+   Py_RETURN_NONE;
+ }
+ 
++PyObject * THCPModule_memoryActive(PyObject *_unused, PyObject *arg)
++{
++  HANDLE_TH_ERRORS
++  THPUtils_assert(THPUtils_checkLong(arg), "invalid argument to memory_active");
++  int device = (int) THPUtils_unpackLong(arg);
++  auto memory_active = c10::cuda::CUDACachingAllocator::currentMemoryActive(device);
++  return PyLong_FromUnsignedLongLong(memory_active);
++  END_HANDLE_TH_ERRORS
++}
++
++PyObject * THCPModule_maxMemoryActive(PyObject *_unused, PyObject *arg)
++{
++  HANDLE_TH_ERRORS
++  THPUtils_assert(THPUtils_checkLong(arg), "invalid argument to max_memory_active");
++  int device = (int) THPUtils_unpackLong(arg);
++  auto max_memory_active = c10::cuda::CUDACachingAllocator::maxMemoryActive(device);
++  return PyLong_FromUnsignedLongLong(max_memory_active);
++  END_HANDLE_TH_ERRORS
++}
++
++PyObject * THCPModule_resetMaxMemoryActive(PyObject *_unused, PyObject *arg)
++{
++  HANDLE_TH_ERRORS
++  THPUtils_assert(THPUtils_checkLong(arg), "invalid argument to reset_max_memory_active");
++  int device = (int) THPUtils_unpackLong(arg);
++  c10::cuda::CUDACachingAllocator::resetMaxMemoryActive(device);
++  END_HANDLE_TH_ERRORS
++  Py_RETURN_NONE;
++}
++
++PyObject * THCPModule_memoryReclaimed(PyObject *_unused, PyObject *arg)
++{
++  HANDLE_TH_ERRORS
++  THPUtils_assert(THPUtils_checkLong(arg), "invalid argument to memory_reclaimed");
++  int device = (int) THPUtils_unpackLong(arg);
++  auto memory_reclaimed = c10::cuda::CUDACachingAllocator::currentMemoryReclaimed(device);
++  return PyLong_FromUnsignedLongLong(memory_reclaimed);
++  END_HANDLE_TH_ERRORS
++}
++
++PyObject * THCPModule_resetMemoryReclaimed(PyObject *_unused, PyObject *arg)
++{
++  HANDLE_TH_ERRORS
++  THPUtils_assert(THPUtils_checkLong(arg), "invalid argument to reset_memory_reclaimed");
++  int device = (int) THPUtils_unpackLong(arg);
++  c10::cuda::CUDACachingAllocator::resetMemoryReclaimed(device);
++  END_HANDLE_TH_ERRORS
++  Py_RETURN_NONE;
++}
++
++const char* const bucket_label[c10::cuda::CUDACachingAllocator::NUM_ALLOC_SOURCES] = {
++  "freelist",
++  "cudamalloc",
++  "reclaim_one",
++  "reclaim_fragments",
++  "cudamalloc_over_limit",
++  "reclaim_all",
++  "cudamalloc_purge"
++};
++
++PyObject * THCPModule_allocDistribution(PyObject *_unused, PyObject *arg)
++{
++  HANDLE_TH_ERRORS
++  THPUtils_assert(THPUtils_checkLong(arg), "invalid argument to alloc_distribution");
++  int device = (int) THPUtils_unpackLong(arg);
++  const int nbuckets = c10::cuda::CUDACachingAllocator::NUM_ALLOC_SOURCES;
++  uint64_t counts[nbuckets];
++  c10::cuda::CUDACachingAllocator::currentAllocDistribution(device, counts);
++  PyObject* distribution = PyDict_New();
++  for (int i = 0; i < nbuckets; i++)
++    PyDict_SetItemString(distribution, bucket_label[i], PyLong_FromUnsignedLongLong(counts[i]));
++  return distribution;
++  END_HANDLE_TH_ERRORS
++}
++
++PyObject * THCPModule_resetAllocDistribution(PyObject *_unused, PyObject *arg)
++{
++  HANDLE_TH_ERRORS
++  THPUtils_assert(THPUtils_checkLong(arg), "invalid argument to reset_alloc_distribution");
++  int device = (int) THPUtils_unpackLong(arg);
++  c10::cuda::CUDACachingAllocator::resetAllocDistribution(device);
++  END_HANDLE_TH_ERRORS
++  Py_RETURN_NONE;
++}
++
++PyObject *THCPModule_setUserEnabledLMS(PyObject *_unused, PyObject *arg)
++{
++  HANDLE_TH_ERRORS
++  THPUtils_assert(PyBool_Check(arg), "set_enabled_lms expects a bool, "
++          "but got %s", THPUtils_typename(arg));
++  c10::cuda::CUDACachingAllocator::setUserEnabledLMS(arg == Py_True);
++  Py_RETURN_NONE;
++  END_HANDLE_TH_ERRORS
++}
++
++PyObject *THCPModule_userEnabledLMS(PyObject *_unused)
++{
++  HANDLE_TH_ERRORS
++  if (c10::cuda::CUDACachingAllocator::userEnabledLMS()) Py_RETURN_TRUE;
++  else Py_RETURN_FALSE;
++  END_HANDLE_TH_ERRORS
++}
++
++PyObject *THCPModule_setUserSizeLMS(PyObject *_unused, PyObject *arg)
++{
++  HANDLE_TH_ERRORS
++  THPUtils_assert(THPUtils_checkLong(arg), "invalid argument to set_size_lms");
++  size_t size = THPUtils_unpackLong(arg);
++  c10::cuda::CUDACachingAllocator::setUserSizeLMS(size);
++  Py_RETURN_NONE;
++  END_HANDLE_TH_ERRORS
++}
++
++PyObject *THCPModule_userSizeLMS(PyObject *_unused)
++{
++  HANDLE_TH_ERRORS
++  return PyLong_FromLong(c10::cuda::CUDACachingAllocator::userSizeLMS());
++  END_HANDLE_TH_ERRORS
++}
++
++PyObject *THCPModule_setUserLimitLMS(PyObject *_unused, PyObject *arg)
++{
++  HANDLE_TH_ERRORS
++  THPUtils_assert(THPUtils_checkLong(arg), "invalid argument to set_limit_lms");
++  size_t limit = THPUtils_unpackLong(arg);
++  c10::cuda::CUDACachingAllocator::setUserLimitLMS(limit);
++  Py_RETURN_NONE;
++  END_HANDLE_TH_ERRORS
++}
++
++PyObject *THCPModule_userLimitLMS(PyObject *_unused)
++{
++  HANDLE_TH_ERRORS
++  return PyLong_FromLong(c10::cuda::CUDACachingAllocator::userLimitLMS());
++  END_HANDLE_TH_ERRORS
++}
++
++PyObject * THCPModule_reclaimInactive(PyObject *_unused)
++{
++  HANDLE_TH_ERRORS
++  c10::cuda::CUDACachingAllocator::reclaimInactive();
++  END_HANDLE_TH_ERRORS
++  Py_RETURN_NONE;
++}
++
+ ////////////////////////////////////////////////////////////////////////////////
+ // Cuda module initialization
+ ////////////////////////////////////////////////////////////////////////////////
+@@ -418,6 +563,20 @@ static struct PyMethodDef _THCPModule_methods[] = {
+   {"_cuda_memoryCached", (PyCFunction) THCPModule_memoryCached, METH_O,  nullptr},
+   {"_cuda_maxMemoryCached", (PyCFunction) THCPModule_maxMemoryCached, METH_O,  nullptr},
+   {"_cuda_resetMaxMemoryCached", (PyCFunction) THCPModule_resetMaxMemoryCached, METH_O,  nullptr},
++  {"_cuda_memoryActive", (PyCFunction) THCPModule_memoryActive, METH_O,  nullptr},
++  {"_cuda_maxMemoryActive", (PyCFunction) THCPModule_maxMemoryActive, METH_O,  nullptr},
++  {"_cuda_resetMaxMemoryActive", (PyCFunction) THCPModule_resetMaxMemoryActive, METH_O,  nullptr},
++  {"_cuda_memoryReclaimed", (PyCFunction) THCPModule_memoryReclaimed, METH_O,  nullptr},
++  {"_cuda_resetMemoryReclaimed", (PyCFunction) THCPModule_resetMemoryReclaimed, METH_O,  nullptr},
++  {"_cuda_allocDistribution", (PyCFunction) THCPModule_allocDistribution, METH_O,  nullptr},
++  {"_cuda_resetAllocDistribution", (PyCFunction) THCPModule_resetAllocDistribution, METH_O,  nullptr},
++  {"_cuda_getEnabledLMS", (PyCFunction)THCPModule_userEnabledLMS, METH_NOARGS, nullptr},
++  {"_cuda_setEnabledLMS", (PyCFunction)THCPModule_setUserEnabledLMS, METH_O,   nullptr},
++  {"_cuda_getSizeLMS", (PyCFunction)THCPModule_userSizeLMS, METH_NOARGS,       nullptr},
++  {"_cuda_setSizeLMS", (PyCFunction)THCPModule_setUserSizeLMS, METH_O,         nullptr},
++  {"_cuda_getLimitLMS", (PyCFunction)THCPModule_userLimitLMS, METH_NOARGS,     nullptr},
++  {"_cuda_setLimitLMS", (PyCFunction)THCPModule_setUserLimitLMS, METH_O,       nullptr},
++  {"_cuda_reclaimInactive", (PyCFunction) THCPModule_reclaimInactive, METH_NOARGS,  nullptr},
+   {"_cuda_cudaHostAllocator", (PyCFunction)THCPModule_cudaHostAllocator, METH_NOARGS, nullptr},
+   {"_cuda_synchronize", (PyCFunction)THCPModule_cudaSynchronize, METH_NOARGS, nullptr},
+   {"_cuda_ipc_collect", (PyCFunction)THCPModule_cudaIPCCollect, METH_NOARGS, nullptr},
+diff --git a/torch/csrc/generic/serialization.cpp b/torch/csrc/generic/serialization.cpp
+index f4e47a436c..940fa8757d 100644
+--- a/torch/csrc/generic/serialization.cpp
++++ b/torch/csrc/generic/serialization.cpp
+@@ -20,7 +20,7 @@ void THPStorage_(writeFileRaw)(THWStorage *self, io fd)
+ #else
+   std::unique_ptr<char[]> cpu_data(new char[size * sizeof(scalar_t)]);
+   data = (scalar_t*)cpu_data.get();
+-  THCudaCheck(cudaMemcpy(data, THWStorage_(data)(LIBRARY_STATE self), size * sizeof(scalar_t), cudaMemcpyDeviceToHost));
++  THCStorage_copy_to_host(LIBRARY_STATE self, data);
+ #endif
+   doWrite(fd, &size, sizeof(int64_t));
+   // fast track for bytes and little endian
+diff --git a/torch/cuda/__init__.py b/torch/cuda/__init__.py
+index 411cfb7315..77392fdbd8 100644
+--- a/torch/cuda/__init__.py
++++ b/torch/cuda/__init__.py
+@@ -562,6 +562,181 @@ def reset_max_memory_cached(device=None):
+     return torch._C._cuda_resetMaxMemoryCached(device)
+ 
+ 
++def memory_active(device=None):
++    r"""Returns the current GPU memory occupied by active tensors in bytes for a given
++    device.
++
++    Arguments:
++        device (torch.device or int, optional): selected device. Returns
++            statistic for the current device, given by :func:`~torch.cuda.current_device`,
++            if :attr:`device` is ``None`` (default).
++
++    .. note::
++        When Large Model Support is enabled, this should be less than the total amount of
++        GPU memory occupied by tensors.
++    """
++    device = _get_device_index(device, optional=True)
++    return torch._C._cuda_memoryActive(device)
++
++
++def max_memory_active(device=None):
++    r"""Returns the maximum GPU memory occupied by active tensors in bytes for a given
++    device.
++
++    By default, this returns the peak active memory since the beginning of
++    this program. :func:`~torch.cuda.reset_max_memory_active` can be used to
++    reset the starting point in tracking this metric. For example, these two
++    functions can measure the peak active memory usage of each iteration in a
++    training loop.
++
++    Arguments:
++        device (torch.device or int, optional): selected device. Returns
++            statistic for the current device, given by :func:`~torch.cuda.current_device`,
++            if :attr:`device` is ``None`` (default).
++    """
++    device = _get_device_index(device, optional=True)
++    return torch._C._cuda_maxMemoryActive(device)
++
++
++def reset_max_memory_active(device=None):
++    r"""Resets the starting point in tracking maximum GPU memory occupied by
++    active tensors for a given device.
++
++    See :func:`~torch.cuda.max_memory_allocated` for details.
++
++    Arguments:
++        device (torch.device or int, optional): selected device. Returns
++            statistic for the current device, given by :func:`~torch.cuda.current_device`,
++            if :attr:`device` is ``None`` (default).
++    """
++    device = _get_device_index(device, optional=True)
++    return torch._C._cuda_resetMaxMemoryActive(device)
++
++
++def memory_reclaimed(device=None):
++    r"""Returns the total GPU memory transferred to the host by Large Model Support
++    in bytes for a given device.
++
++    Arguments:
++        device (torch.device or int, optional): selected device. Returns
++            statistic for the current device, given by :func:`~torch.cuda.current_device`,
++            if :attr:`device` is ``None`` (default).
++
++    .. note::
++        This will be non-zero only when Large Model Support is enabled.
++    """
++    device = _get_device_index(device, optional=True)
++    return torch._C._cuda_memoryReclaimed(device)
++
++def reset_memory_reclaimed(device=None):
++    r"""Resets the starting point in tracking the total GPU memory transfered to the host
++    by Large Model Support.
++
++    See :func:`~torch.cuda.memory_reclaimed` for details.
++
++    Arguments:
++        device (torch.device or int, optional): selected device. Returns
++            statistic for the current device, given by :func:`~torch.cuda.current_device`,
++            if :attr:`device` is ``None`` (default).
++    """
++    device = _get_device_index(device, optional=True)
++    return torch._C._cuda_resetMemoryReclaimed(device)
++
++def alloc_distribution(device=None):
++    r"""Returns a histogram (encoded as a python dictionary) showing the distribution of allocation
++    sources for a given device.  Each allocation satisfied by the CUDA Caching Allocator is retrieved
++    from a particular source.  The allocation distribution counts the number of allocations satisfied
++    from each source.
++
++    The set of possible sources are:
++
++    * `'freelist'`
++    * `'cudamalloc'`
++    * `'reclaim_one'`
++    * `'reclaim_fragments'`
++    * `'cudamalloc_over_limit'`
++    * `'reclaim_all'`
++    * `'cudamalloc_purge'`
++
++    Arguments:
++        device (torch.device or int, optional): selected device. Returns
++            statistic for the current device, given by :func:`~torch.cuda.current_device`,
++            if :attr:`device` is ``None`` (default).
++
++    .. note::
++        The `reclaim_one`, `reclaim_fragments`, `cudamalloc_over_limit`, and `reclaim_all` allocation
++        sources are applicable only when Large Model Support is enabled.
++    """
++
++    device = _get_device_index(device, optional=True)
++    return torch._C._cuda_allocDistribution(device)
++
++def reset_alloc_distribution(device=None):
++    r"""Resets the starting point in tracking the distribution of allocation sources.
++
++    See :func:`~torch.cuda.alloc_distribution` for details.
++
++    Arguments:
++        device (torch.device or int, optional): selected device. Returns
++            statistic for the current device, given by :func:`~torch.cuda.current_device`,
++            if :attr:`device` is ``None`` (default).
++    """
++    device = _get_device_index(device, optional=True)
++    return torch._C._cuda_resetAllocDistribution(device)
++
++def set_enabled_lms(enable):
++    r"""Enable/disable Large Model Support.
++
++    Arguments:
++        enable (bool): desired LMS setting.
++    """
++    torch._C._cuda_setEnabledLMS(enable)
++
++
++def get_enabled_lms():
++    r"""Returns a bool indicating if Large Model Support is currently enabled."""
++    return torch._C._cuda_getEnabledLMS()
++
++
++def set_size_lms(size):
++    r"""Mininum size (in bytes) for LMS.
++
++    Arguments:
++        size (integer): Any memory block larger than this will be subject to LMS optimization.
++    """
++    torch._C._cuda_setSizeLMS(size)
++
++
++def get_size_lms():
++    r"""Returns the minimum size (in bytes) for LMS."""
++    return torch._C._cuda_getSizeLMS()
++
++
++def set_limit_lms(limit):
++    r"""Allocation limit (in bytes) for LMS.
++
++    Arguments:
++        limit (integer): LMS limit on device memory.
++    """
++    torch._C._cuda_setLimitLMS(limit)
++
++
++def get_limit_lms():
++    r"""Returns the limit (in bytes) for LMS."""
++    return torch._C._cuda_getLimitLMS()
++
++
++def reclaim_inactive():
++    r"""Swaps the memory of all inactive tensors out to the host so that those can be returned
++    to the caching allocator.
++
++    .. note::
++        The set of inactive tensors is maintained only when Large Model Support is enabled.
++    """
++    if _initialized:
++        torch._C._cuda_reclaimInactive()
++
++
+ def _host_allocator():
+     _lazy_init()
+     return torch._C._cuda_cudaHostAllocator()
+-- 
+2.21.0 (Apple Git-122)
+
