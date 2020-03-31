@@ -1,4 +1,17 @@
+#### &lt;Call for Feedback&gt;
+
+A PyTorch LMS user recently opened an issue asking for community support to integrate LMS into an official version of PyTorch:
+
+https://github.com/pytorch/pytorch/issues/35633
+
+This is a good opportunity to gather any and all user testimonials and success stories to document the value of LMS in a public place.  Please feel free to share your support and any thoughts there in the conversation.
+
+#### &lt;/Call for Feedback&gt;
+
+***
+
 # PyTorch Large Model Support
+
 PyTorch Large Model Support (LMS) is a feature in the PyTorch provided
 by [IBM Watson Machine Learning Community Edition](https://public.dhe.ibm.com/ibmdl/export/pub/software/server/ibm-ai/conda/) (WML CE) that allows the
 successful training of deep learning models that would otherwise exhaust GPU
